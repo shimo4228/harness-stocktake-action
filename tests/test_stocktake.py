@@ -460,13 +460,13 @@ class ApplyPublishTest(Base):
             )
         )
 
-    def git(self, log="abc1234 docs: update README", branches="stocktake/2026-11-01"):
+    def git(self, log="abc1234 docs: update README", branches="stocktake/2026-11-01", changed="README.md"):
         def run(*args):
             self.git_calls.append(args)
             if args[0] == "for-each-ref":
                 return branches
             if args[0] == "log":
-                return log
+                return changed if "--name-only" in args else log
             return ""
 
         return run
@@ -475,6 +475,8 @@ class ApplyPublishTest(Base):
         args = st.build_parser().parse_args(
             [
                 "apply-publish",
+                "--workspace",
+                str(self.root),
                 "--run-date",
                 "2026-11-01",
                 "--default-branch",
@@ -501,6 +503,7 @@ class ApplyPublishTest(Base):
         self.assertIn("docs-01", pr["body"])
         self.assertNotIn("skills-01", pr["body"])
         self.assertIn("Applied docs-01", pr["body"])
+        self.assertIn("1 applied", pr["body"])
         self.assertIn("pull/50", self.gh.issues[7]["body"])
         self.assertEqual(self.outputs()["pr_url"], "https://github.com/o/r/pull/50")
 
@@ -548,6 +551,315 @@ class ApplyPublishTest(Base):
         body = self.gh.prs[0]["body"]
         self.assertNotIn("@org", body)
         self.assertNotIn("<!-- x", body)
+
+
+SMOKE_ITEMS = [
+    item("hooks-02", "Retire", ".claude/hooks/notify-done.sh", source="hooks", order=1),
+    item("hooks-03", "Retire", ".claude/settings.json", source="hooks", order=2),
+    item("docs-01", "Update", "CLAUDE.md", source="docs", order=3),
+    item("docs-03", "Update", "CLAUDE.md", source="docs", order=4),
+    item("skills-02", "Improve", ".claude/skills/deploy/SKILL.md", order=5),
+    item("rules-01", "Merge", ".claude/rules/style.md", source="rules", order=6),
+    item("docs-05", "Keep", "docs/adr/0001-in-memory-store.md", source="docs", order=7),
+    item("assets-04", "Keep", "docs/adr/0001-in-memory-store.md", source="assets", order=8),
+    item("distill-03", "Too Specific", ".claude/skills/code-review/SKILL.md", source="distill", order=9),
+    item("skills-04", "Keep", ".claude/skills/code-review/SKILL.md", order=10),
+]
+
+
+class ProtectedPathTest(unittest.TestCase):
+    def test_protected_paths_follow_claude_code(self):
+        for path in [
+            ".claude/settings.json",
+            ".claude/skills/x/SKILL.md",
+            ".claude/agents/a.md",
+            "sub/.claude/rules/r.md",
+            ".mcp.json",
+            ".git/hooks/pre-commit",
+            ".config/git/ignore",
+        ]:
+            self.assertTrue(st.is_protected(path), path)
+        for path in ["CLAUDE.md", "README.md", "docs/adr/1.md", ".claude/worktrees/w/x.md", ".claudeignore"]:
+            self.assertFalse(st.is_protected(path), path)
+
+    def test_needs_hand(self):
+        hand = {i["id"]: st.needs_hand(i) for i in SMOKE_ITEMS if st.verdict_group(i["verdict"]) != "Keep"}
+        self.assertEqual(
+            hand,
+            {
+                "hooks-02": False,  # a Retire is a git rm, which Claude Code allows
+                "hooks-03": True,  # retiring a hook entry edits settings.json
+                "docs-01": False,
+                "docs-03": False,
+                "skills-02": True,
+                "rules-01": True,
+            },
+        )
+        grouped = item("x-01", "Update", "group", targets=["README.md", ".claude/rules/a.md"])
+        self.assertTrue(st.needs_hand(grouped))
+        self.assertTrue(st.needs_hand(item("x-02", "Retire", ".mcp.json")))
+        self.assertTrue(st.needs_hand(item("x-03", "Retire", "packages/app/.claude/settings.json")))
+        self.assertFalse(st.needs_hand(item("x-04", "Retire", ".pre-commit-config.yaml")))
+        self.assertTrue(st.needs_hand(item("x-05", "Update", ".pre-commit-config.yaml")))
+
+
+class IssueTagsTest(unittest.TestCase):
+    def test_hand_items_are_flagged_from_the_start(self):
+        body = st.render_body({"report_date": "2026-11-01", "items": SMOKE_ITEMS}, {})
+        rows = {ln.split("`")[1]: ln for ln in body.splitlines() if st.CHECKBOX.match(ln)}
+        self.assertIn(st.TAG_HAND, rows["hooks-03"])
+        self.assertIn(st.TAG_HAND, rows["skills-02"])
+        self.assertNotIn(st.TAG_HAND, rows["hooks-02"])
+        self.assertNotIn(st.TAG_HAND, rows["docs-01"])
+        self.assertIn(st.README_URL, body)
+        # The tag does not get in the way of reading the boxes.
+        self.assertEqual(set(st.read_marks(body)[0]), set(rows))
+
+    def test_no_legend_without_hand_items(self):
+        body = st.render_body({"report_date": "2026-11-01", "items": [ITEMS[1]]}, {})
+        self.assertNotIn(st.TAG_HAND, body)
+
+    def test_kept_paths_are_listed_once(self):
+        body = st.render_body({"report_date": "2026-11-01", "items": SMOKE_ITEMS}, {})
+        kept = body.split("<summary>Kept items</summary>")[1].split("</details>")[0]
+        self.assertEqual(kept.count("docs/adr/0001-in-memory-store.md"), 1)
+        self.assertEqual(kept.count(".claude/skills/code-review/SKILL.md"), 1)
+        self.assertIn("Keep (docs, assets)", kept)
+        self.assertIn("Too Specific (distill) · Keep (skills)", kept)
+
+
+class ItemStatusTest(unittest.TestCase):
+    def test_the_branch_decides(self):
+        approved = [SMOKE_ITEMS[0], SMOKE_ITEMS[1], SMOKE_ITEMS[2]]
+        changed = {".claude/hooks/notify-done.sh", "CLAUDE.md"}
+        status = st.item_status(approved, changed, {})
+        self.assertEqual(
+            {k: v["status"] for k, v in status.items()},
+            {"hooks-02": "applied", "hooks-03": "pending", "docs-01": "applied"},
+        )
+
+    def test_a_claim_cannot_apply_an_unchanged_file(self):
+        outcomes = {"hooks-03": {"outcome": "applied"}}
+        status = st.item_status([SMOKE_ITEMS[1]], {"CLAUDE.md"}, outcomes)
+        self.assertEqual(status["hooks-03"]["status"], "pending")
+
+    def test_a_pending_record_wins_over_a_shared_file(self):
+        approved = [SMOKE_ITEMS[2], SMOKE_ITEMS[3]]
+        outcomes = {"docs-03": {"outcome": "pending", "note": "needs a choice", "diff": "-a\n+b"}}
+        status = st.item_status(approved, {"CLAUDE.md"}, outcomes)
+        self.assertEqual(status["docs-01"]["status"], "applied")
+        self.assertEqual(status["docs-01"]["shared"], ["docs-03"])
+        self.assertEqual(
+            status["docs-03"],
+            {"status": "pending", "note": "needs a choice", "diff": "-a\n+b", "partial": ["CLAUDE.md"]},
+        )
+
+    def test_directories_and_globs(self):
+        retire_dir = item("skills-09", "Retire", ".claude/skills/old")
+        glob = item("skills-08", "Retire", ".claude/skills/pack-*/SKILL.md")
+        changed = {".claude/skills/old/SKILL.md", ".claude/skills/pack-a/SKILL.md"}
+        status = st.item_status([retire_dir, glob], changed, {})
+        self.assertEqual({v["status"] for v in status.values()}, {"applied"})
+
+    def test_every_path_must_change(self):
+        merge = item(
+            "rules-01", "Merge", ".claude/rules/style.md", targets=[".claude/rules/style.md", "CLAUDE.md"]
+        )
+        status = st.item_status([merge], {"CLAUDE.md"}, {})["rules-01"]
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(status["partial"], ["CLAUDE.md"])
+        self.assertIn(".claude/rules/style.md", status["note"])
+        both = st.item_status([merge], {"CLAUDE.md", ".claude/rules/style.md"}, {})["rules-01"]
+        self.assertEqual(both["status"], "pending")  # it edits .claude/: needs the run's own record
+        claimed = st.item_status(
+            [merge], {"CLAUDE.md", ".claude/rules/style.md"}, {"rules-01": {"outcome": "applied"}}
+        )
+        self.assertEqual(claimed["rules-01"]["status"], "applied")
+
+    def test_hand_item_without_a_record_is_not_applied(self):
+        improve = item("skills-02", "Improve", ".claude/skills/deploy/SKILL.md")
+        status = st.item_status([improve], {".claude/skills/deploy/SKILL.md"}, {})["skills-02"]
+        self.assertEqual(status["status"], "pending")
+        self.assertIn("cannot edit", status["note"])
+
+    def test_load_outcomes_tolerates_shapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "outcomes.json"
+            self.assertEqual(st.load_outcomes(path), {})
+            path.write_text("not json")
+            self.assertEqual(st.load_outcomes(path), {})
+            path.write_text(json.dumps([{"id": "a-01", "outcome": "pending"}, "junk"]))
+            self.assertEqual(st.load_outcomes(path), {"a-01": {"id": "a-01", "outcome": "pending"}})
+            path.write_text(json.dumps({"a-01": "applied", "a-02": 3}))
+            self.assertEqual(st.load_outcomes(path), {"a-01": {"outcome": "applied"}})
+
+
+class SmokePublishTest(Base):
+    """The smoke test's apply: hooks-02 and docs-01 committed, hooks-03 (settings.json) denied."""
+
+    def setUp(self):
+        super().setUp()
+        data = {"report_date": "2026-11-01", "items": SMOKE_ITEMS}
+        ticked = {"hooks-02": True, "hooks-03": True, "docs-01": True}
+        self.gh = FakeGitHub(
+            issues=[
+                {
+                    "number": 1,
+                    "title": st.ISSUE_TITLE,
+                    "user": {"type": "Bot", "login": "github-actions[bot]"},
+                    "body": st.render_body(data, ticked),
+                }
+            ]
+        )
+
+    def git(self, log, changed):
+        def run(*args):
+            if args[0] == "log":
+                return changed if "--name-only" in args else log
+            return {"for-each-ref": "stocktake/2026-11-01"}.get(args[0], "")
+
+        return run
+
+    def publish(self, log="1016069 docs\na793a4b chore", changed=".claude/hooks/notify-done.sh\nCLAUDE.md"):
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--workspace",
+                str(self.root),
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--run-url",
+                RUN_URL,
+                "--issue-number",
+                "1",
+            ]
+        )
+        return st.cmd_apply_publish(args, self.gh, self.git(log, changed))
+
+    def test_pr_separates_applied_from_pending(self):
+        self.assertEqual(self.publish(), 0)
+        body = self.gh.prs[0]["body"]
+        applied, pending = body.split("**Pending, apply by hand")
+        pending = pending.split("### Commits")[0]
+        self.assertIn("`hooks-02`", applied)
+        self.assertIn("`docs-01`", applied)
+        self.assertNotIn("`hooks-03`", applied)
+        self.assertIn("`hooks-03`", pending)
+        self.assertIn("### Pending items", pending)
+        self.assertIn("2 applied", body)
+        self.assertIn("1 left for you to apply by hand", body)
+        # No diff was recorded: the approved change stands in for it.
+        self.assertIn("change hooks-03", pending)
+
+        issue = self.gh.issues[1]["body"]
+        rows = {ln.split("`")[1]: ln for ln in issue.splitlines() if st.CHECKBOX.match(ln)}
+        self.assertIn(st.TAG_APPLIED, rows["hooks-02"])
+        self.assertIn(st.TAG_APPLIED, rows["docs-01"])
+        self.assertIn(st.TAG_PENDING, rows["hooks-03"])
+        self.assertIn(st.TAG_HAND, rows["skills-02"])  # not ticked: still the up-front flag
+        self.assertIn("applied 2 of 3 item(s), 1 pending", issue)
+
+    def test_pending_diff_comes_from_outcomes_json(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        diff = '-      {\n-        "matcher": "Bash",\n```nested```'
+        (run / st.OUTCOMES_FILE).write_text(
+            json.dumps(
+                {"hooks-03": {"outcome": "pending", "note": "Edit denied on settings.json", "diff": diff}}
+            )
+        )
+        self.publish()
+        body = self.gh.prs[0]["body"]
+        self.assertIn("Edit denied on settings.json", body)
+        self.assertIn('"matcher": "Bash"', body)
+        self.assertIn("````diff", body)  # fence longer than the backticks inside
+
+    def test_changed_files_use_the_commit_range_and_skip_notes(self):
+        calls = []
+
+        def git(*args):
+            calls.append(args)
+            if args[0] == "log" and "--name-only" in args:
+                return "CLAUDE.md\n.notes/stocktake/2026-11-01/outcomes.json\n"
+            return ""
+
+        self.assertEqual(st.changed_files(git, "main", "stocktake/x"), {"CLAUDE.md"})
+        self.assertIn("origin/main..stocktake/x", calls[0])
+
+    def test_changed_files_failure_warns(self):
+        def git(*args):
+            raise subprocess.CalledProcessError(128, "git")
+
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            self.assertEqual(st.changed_files(git, "main", "x"), set())
+        self.assertIn("::warning::", out.getvalue())
+
+    def test_pr_body_fits_githubs_limit(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        big = "\n".join(f"-line {n} " + "x" * 80 for n in range(400))  # ~36k
+        outcomes = {i: {"outcome": "pending", "diff": big} for i in ("hooks-02", "hooks-03", "docs-01")}
+        (run / st.OUTCOMES_FILE).write_text(json.dumps(outcomes))
+        execution = self.root / "exec.json"
+        execution.write_text(json.dumps([{"type": "result", "result": "r" * 60_000}]))
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--workspace",
+                str(self.root),
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--run-url",
+                RUN_URL,
+                "--issue-number",
+                "1",
+                "--execution-file",
+                str(execution),
+            ]
+        )
+        self.assertEqual(st.cmd_apply_publish(args, self.gh, self.git("abc x", "CLAUDE.md")), 0)
+        body = self.gh.prs[0]["body"]
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        self.assertIn("### Pending items", body)
+
+    def test_unticked_item_drops_its_result(self):
+        self.publish()
+        body = self.gh.issues[1]["body"].replace("- [x] `docs-01`", "- [ ] `docs-01`")
+        data = st.decode_data(body)
+        marks, _ = st.read_marks(body)
+        rerendered = st.render_body(data, marks)
+        rows = {ln.split("`")[1]: ln for ln in rerendered.splitlines() if st.CHECKBOX.match(ln)}
+        self.assertNotIn(st.TAG_APPLIED, rows["docs-01"])
+        self.assertIn(st.TAG_APPLIED, rows["hooks-02"])
+
+    def test_no_commit_marks_every_ticked_item_pending(self):
+        self.assertEqual(self.publish(log="", changed=""), 0)
+        self.assertEqual(self.gh.prs, [])
+        issue = self.gh.issues[1]["body"]
+        rows = {ln.split("`")[1]: ln for ln in issue.splitlines() if st.CHECKBOX.match(ln)}
+        for id_ in ("hooks-02", "hooks-03", "docs-01"):
+            self.assertIn(st.TAG_PENDING, rows[id_])
+
+    def test_next_apply_starts_clean(self):
+        self.publish()
+        body = self.gh.issues[1]["body"].replace(f"- [ ] **{st.APPLY_LABEL}**", f"- [x] **{st.APPLY_LABEL}**")
+        event = self.root / "event.json"
+        issue = dict(self.gh.issues[1], body=body)
+        event.write_text(json.dumps({"issue": issue, "sender": {"login": "owner"}}))
+        stale = self.root / st.REPORT_ROOT / "2026-11-01" / st.OUTCOMES_FILE
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("{}")
+        args = st.build_parser().parse_args(
+            ["apply-prepare", "--workspace", str(self.root), "--event-path", str(event), "--run-url", RUN_URL]
+        )
+        self.assertEqual(st.cmd_apply_prepare(args, self.gh), 0)
+        self.assertNotIn("outcomes", st.decode_data(self.gh.issues[1]["body"]))
+        self.assertNotIn(st.TAG_PENDING, self.gh.issues[1]["body"])
+        self.assertFalse(stale.exists())
 
 
 class MarkFailedTest(Base):
