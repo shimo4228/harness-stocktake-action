@@ -995,6 +995,46 @@ class SmokePublishTest(Base):
         status = st.item_status([SMOKE_ITEMS[1]], set(), {"hooks-03": {"outcome": "pending", "diff": diff}})
         self.assertEqual(status["hooks-03"]["diff"], diff)
 
+    def test_short_diff_is_shown_at_the_last_tier(self):
+        pending = [SMOKE_ITEMS[1]]
+        status = {"hooks-03": {"status": "pending", "diff": "-a\n+b"}}
+        body = st.pr_body({"report_date": "2026-11-01"}, pending, status, 1, RUN_URL, "b", "", "", 0, 0, 300)
+        self.assertIn("```diff\n-a\n+b\n```", body)
+        self.assertNotIn("too long", body)
+
+    def test_pending_details_go_to_the_run_summary(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        diff = "\n".join(f"-line {n} " + "x" * 90 for n in range(300))  # ~30k: too long for the body
+        (run / st.OUTCOMES_FILE).write_text(
+            json.dumps({"hooks-03": {"outcome": "pending", "note": "apply by hand", "diff": diff}})
+        )
+        summary = self.root / "apply-summary.md"
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--workspace",
+                str(self.root),
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--run-url",
+                RUN_URL,
+                "--issue-number",
+                "1",
+                "--summary",
+                str(summary),
+            ]
+        )
+        log, changed = "1016069 docs\na793a4b chore", ".claude/hooks/notify-done.sh\nCLAUDE.md"
+        self.assertEqual(st.cmd_apply_publish(args, self.gh, self.git(log, changed)), 0)
+        text = summary.read_text()
+        self.assertIn(st._label(SMOKE_ITEMS[1]), text)
+        self.assertIn("apply by hand", text)
+        self.assertIn(diff, text)
+        self.assertNotIn("-line 0 ", self.gh.prs[0]["body"])
+
     def test_close_blocks_after_a_cut(self):
         text = "<details><summary>s</summary>\n\n````diff\n+a\n```\n+b"
         closed = st._close_blocks(text)

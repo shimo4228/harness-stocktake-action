@@ -904,7 +904,7 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 1, 0)].rstrip() + "…"
 
 
-CHANGE_FLOOR = 500  # an approved change this short is always shown whole
+CHANGE_FLOOR = 500  # a diff or an approved change this short is always shown whole
 
 
 def _pending_line(item: Item) -> str:
@@ -920,6 +920,22 @@ def _drop_dead_links(body: str, pending: list[Item]) -> str:
             cut = line.replace("see [Pending items](#pending-items)", "details: see the run's summary")
             body = body.replace(line, cut)
     return body
+
+
+def pending_details(pending: list[Item], status: dict[str, Item]) -> str:
+    """Each pending item's note, diff and approved change in full, for the run's summary.
+
+    The PR body shortens or drops these to fit; the summary is where it sends the reader."""
+    lines = ["## Pending items, in full", ""]
+    for i in pending:
+        entry = status[str(i["id"])]
+        lines += [f"### {_label(i)}", ""]
+        if entry.get("note"):
+            lines += [_neutralise(str(entry["note"])), ""]
+        if entry.get("diff"):
+            lines += [*_fence(entry["diff"], "diff"), ""]
+        lines += ["Approved change:", "", *_fence(str(i.get("change") or "(none)")), ""]
+    return "\n".join(lines)
 
 
 def pr_body(
@@ -996,7 +1012,7 @@ def pr_body(
             # A code block shows the diff as written, so it is not neutralised: GitHub neither
             # mentions anyone nor opens a comment from inside one, and the author applies it by hand.
             change = str(i.get("change") or "(none)")
-            if entry.get("diff") and len(entry["diff"]) <= diff_limit:
+            if entry.get("diff") and len(entry["diff"]) <= max(diff_limit, CHANGE_FLOOR):
                 lines += [*_fence(entry["diff"], "diff"), ""]
             elif entry.get("diff"):
                 lines += [
@@ -1055,6 +1071,9 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
     changed = changed_files(git, base, local) if log else set()
     status = item_status(approved, changed, outcomes)
     data["outcomes"] = {k: {"status": v["status"]} for k, v in status.items()}
+    pending_now = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
+    if pending_now:
+        append_summary(args.summary, pending_details(pending_now, status))
     if not log:
         data["last_run"] = stamp(args.run_url, "apply made no commit")
         data["note"] = "The apply run made no commit, so every ticked item is pending; see the run log."
@@ -1087,8 +1106,7 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
         # Still too long (a very long commit list): cut, then close what the cut left open.
         tail = "\n\n… (cut to fit GitHub's limit)\n"
         size = MAX_BODY - len(tail)
-        pending = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
-        while len(closed := _drop_dead_links(_close_blocks(body[:size]), pending) + tail) > MAX_BODY:
+        while len(closed := _drop_dead_links(_close_blocks(body[:size]), pending_now) + tail) > MAX_BODY:
             size -= len(closed) - MAX_BODY
         body = closed
     title = f"Harness stocktake {data.get('report_date')}"
@@ -1132,6 +1150,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--default-branch", default="")
     c.add_argument("--execution-file", default="")
     c.add_argument("--workspace", default=".")
+    c.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
 
     d = sub.add_parser("mark-failed")
     d.add_argument("--message", required=True)
