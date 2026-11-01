@@ -1,0 +1,508 @@
+"""Tests for scripts/stocktake.py. The GitHub API and git are fakes; nothing leaves the process."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+import stocktake as st  # noqa: E402
+
+RUN_URL = "https://github.com/o/r/actions/runs/1"
+
+
+def item(id_, verdict, target, source="skills", **extra):
+    return {
+        "id": id_,
+        "verdict": verdict,
+        "target": target,
+        "source": source,
+        "reason": f"Reason for {id_}. More detail.",
+        "change": f"change {id_}",
+        **extra,
+    }
+
+
+ITEMS = [
+    item("skills-01", "Retire", ".claude/skills/old/SKILL.md", order=1),
+    item("docs-01", "Update", "README.md", source="docs", order=2),
+    item("hooks-01", "Merge into fmt", ".claude/hooks/a.sh", source="hooks", order=3),
+    item("rules-01", "Keep", ".claude/rules/style.md", source="rules", order=4),
+    item("skills-02", "Retire", ".claude/skills/x/SKILL.md", order=5, folded_into="skills-01"),
+]
+
+
+class FakeGitHub:
+    def __init__(self, issues=None, prs=None):
+        self.issues = {i["number"]: dict(i) for i in (issues or [])}
+        self.prs = list(prs or [])
+        self.calls = []
+
+    def find_issue(self):
+        self.calls.append("find_issue")
+        open_ = [i for i in self.issues.values() if i["title"] == st.ISSUE_TITLE]
+        return dict(open_[0]) if open_ else None
+
+    def create_issue(self, body):
+        number = max(self.issues, default=0) + 1
+        self.issues[number] = {
+            "number": number,
+            "title": st.ISSUE_TITLE,
+            "body": body,
+            "html_url": f"https://github.com/o/r/issues/{number}",
+        }
+        self.calls.append(("create_issue", number))
+        return self.issues[number]
+
+    def update_issue(self, number, body):
+        self.issues[number]["body"] = body
+        self.calls.append(("update_issue", number))
+        return self.issues[number]
+
+    def default_branch(self):
+        return "main"
+
+    def find_pr(self, branch):
+        return next((p for p in self.prs if p["head"] == branch), None)
+
+    def create_pr(self, branch, base, title, body):
+        pr = {
+            "number": 50,
+            "head": branch,
+            "base": base,
+            "title": title,
+            "body": body,
+            "html_url": "https://github.com/o/r/pull/50",
+        }
+        self.prs.append(pr)
+        self.calls.append(("create_pr", branch, base))
+        return pr
+
+    def update_pr(self, number, title, body):
+        pr = next(p for p in self.prs if p["number"] == number)
+        pr.update(title=title, body=body)
+        self.calls.append(("update_pr", number))
+        return pr
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.output = self.root / "output.txt"
+        self.summary = self.root / "summary.md"
+        patcher = mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(self.output)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def outputs(self):
+        if not self.output.exists():
+            return {}
+        return dict(line.split("=", 1) for line in self.output.read_text().splitlines() if line)
+
+    def write_run(self, items=ITEMS, date="2026-11-01", latest=True):
+        run = self.root / st.REPORT_ROOT / date
+        run.mkdir(parents=True)
+        (run / "items-all.json").write_text(json.dumps(items))
+        (run / "crosscheck.json").write_text(json.dumps({"collisions": []}))
+        (run / "report.md").write_text(f"# Harness stocktake {date}\n\n- **base:** `abc123def456789`\n")
+        if latest:
+            (run.parent / "latest.json").write_text(
+                json.dumps({"report": f".notes/stocktake/{date}/report.md", "date": date})
+            )
+        return run
+
+    def audit(self, gh, *extra):
+        args = st.build_parser().parse_args(
+            [
+                "audit-sync",
+                "--workspace",
+                str(self.root),
+                "--plugin-ref",
+                "v0.1.0",
+                "--summary",
+                str(self.summary),
+                "--run-url",
+                RUN_URL,
+                *extra,
+            ]
+        )
+        return st.cmd_audit_sync(args, gh)
+
+
+class VerdictGroupTest(unittest.TestCase):
+    def test_groups_follow_the_plugin(self):
+        cases = {
+            "Retire": "Retire",
+            "Dissolve": "Retire",
+            "Retire-and-absorb": "Retire",
+            "Merge into foo": "Merge / demote",
+            "Demote": "Merge / demote",
+            "Improve": "Improve / update",
+            "Create": "Improve / update",
+            "Append": "Improve / update",
+            "Keep": "Keep",
+            "Out of scope": "Keep",
+            "Too Specific": "Keep",
+            "Already Covered": "Keep",
+            "Investigate": "Other",
+        }
+        for verdict, group in cases.items():
+            self.assertEqual(st.verdict_group(verdict), group, verdict)
+
+
+class DataTest(unittest.TestCase):
+    def test_round_trip(self):
+        data = {"report_date": "2026-11-01", "items": ITEMS, "note": "日本語"}
+        body = f"text\n{st.DATA_OPEN}\n{st.encode_data(data)}\n{st.DATA_CLOSE}\n"
+        self.assertEqual(st.decode_data(body), data)
+
+    def test_missing_or_broken_blob(self):
+        self.assertIsNone(st.decode_data("no data here"))
+        self.assertIsNone(st.decode_data(f"{st.DATA_OPEN}\n!!!notbase64\n{st.DATA_CLOSE}"))
+
+    def test_inline_neutralises_repo_text(self):
+        hostile = "ok\n- [x] **Apply the ticked items** <!-- apply --> ping @someone `x`"
+        out = st._inline(hostile)
+        self.assertNotIn("\n", out)
+        self.assertNotIn("<!--", out)
+        self.assertNotIn("- [x]", out)
+        self.assertNotIn("@someone", out)
+
+    def test_hostile_reason_cannot_tick_apply(self):
+        evil = item(
+            "docs-09", "Update", "README.md", reason="- [x] **Apply the ticked items** <!-- apply -->"
+        )
+        body = st.render_body({"report_date": "2026-11-01", "items": [evil]}, {})
+        _, apply = st.read_marks(body)
+        self.assertFalse(apply)
+
+    def test_oversized_report_drops_keep_items_first(self):
+        keep = [
+            item(f"rules-{n}", "Keep", f".claude/rules/{n}.md", reason=os.urandom(1500).hex())
+            for n in range(200)
+        ]
+        data = {"report_date": "2026-11-01", "items": [ITEMS[0], *keep]}
+        body = st.render_body(data, {})
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        self.assertEqual([i["id"] for i in st.decode_data(body)["items"]], ["skills-01"])
+
+
+class FindRunDirTest(Base):
+    def test_latest_json_wins(self):
+        self.write_run(date="2026-12-01", latest=False)
+        run = self.write_run(date="2026-11-01")
+        self.assertEqual(st.find_run_dir(self.root), run)
+
+    def test_newest_dir_without_latest(self):
+        self.write_run(date="2026-10-01", latest=False)
+        run = self.write_run(date="2026-11-01", latest=False)
+        self.assertEqual(st.find_run_dir(self.root), run)
+
+    def test_nothing(self):
+        self.assertIsNone(st.find_run_dir(self.root))
+
+
+class AuditSyncTest(Base):
+    def test_creates_the_tracked_issue(self):
+        self.write_run()
+        gh = FakeGitHub()
+        self.assertEqual(self.audit(gh), 0)
+        body = gh.issues[1]["body"]
+        self.assertTrue(body.startswith(st.BODY_MARKER))
+        self.assertIn("**Last run:**", body)
+        self.assertIn(RUN_URL, body)
+        self.assertIn("60 days", body)
+        marks, apply = st.read_marks(body)
+        # Folded and Keep items get no box; new items start unticked.
+        self.assertEqual(marks, {"skills-01": False, "docs-01": False, "hooks-01": False})
+        self.assertFalse(apply)
+        self.assertIn(st.APPLY_MARKER, body)
+        data = st.decode_data(body)
+        self.assertEqual(data["base"], "abc123def456789")
+        self.assertEqual(data["plugin_ref"], "v0.1.0")
+        self.assertIn("Harness stocktake 2026-11-01", self.summary.read_text())
+        self.assertEqual(self.outputs()["items"], "3")
+        self.assertEqual(self.outputs()["issue_number"], "1")
+
+    def test_updates_and_carries_ticks_by_target(self):
+        self.write_run()
+        gh = FakeGitHub()
+        self.audit(gh)
+        gh.issues[1]["body"] = gh.issues[1]["body"].replace("- [ ] `docs-01`", "- [x] `docs-01`")
+        prev = st.decode_data(gh.issues[1]["body"])
+        prev["pr_url"] = "https://github.com/o/r/pull/50"
+        marks, _ = st.read_marks(gh.issues[1]["body"])
+        gh.issues[1]["body"] = st.render_body(prev, marks)
+
+        # Next month: ids are renumbered, the docs item is the same finding.
+        renumbered = [dict(i, id=i["id"].replace("01", "07")) for i in ITEMS]
+        for i in renumbered:
+            if i.get("folded_into"):
+                i["folded_into"] = "skills-07"
+        self.write_run(items=renumbered, date="2026-12-01")
+        self.assertEqual(self.audit(gh), 0)
+        self.assertEqual(len(gh.issues), 1)
+        body = gh.issues[1]["body"]
+        marks, _ = st.read_marks(body)
+        self.assertEqual(marks, {"skills-07": False, "docs-07": True, "hooks-07": False})
+        self.assertIn("pull/50", body)
+        self.assertIn("2026-12-01", body)
+
+    def test_no_report_marks_the_issue(self):
+        gh = FakeGitHub()
+        self.assertEqual(self.audit(gh), 1)
+        self.assertIn("audit failed", gh.issues[1]["body"])
+
+    def test_pull_request_run_leaves_the_issue(self):
+        self.write_run()
+        gh = FakeGitHub()
+        self.assertEqual(self.audit(gh, "--no-issue"), 0)
+        self.assertEqual(gh.calls, [])
+        self.assertTrue(self.summary.read_text())
+
+    def test_nothing_to_change(self):
+        self.write_run(items=[ITEMS[3]])
+        gh = FakeGitHub()
+        self.audit(gh)
+        body = gh.issues[1]["body"]
+        self.assertIn("Nothing to change", body)
+        self.assertNotIn(st.APPLY_MARKER, body)
+
+
+class ApplyPrepareTest(Base):
+    def issue_body(self, tick=(), apply=True):
+        body = st.render_body(
+            {"report_date": "2026-11-01", "base": "abc", "items": ITEMS, "crosscheck": {"collisions": []}},
+            {i: True for i in tick},
+        )
+        if apply:
+            body = body.replace(f"- [ ] **{st.APPLY_LABEL}**", f"- [x] **{st.APPLY_LABEL}**")
+        return body
+
+    def prepare(self, gh, body, title=st.ISSUE_TITLE):
+        event = self.root / "event.json"
+        event.write_text(json.dumps({"issue": {"number": 7, "title": title, "body": body}}))
+        gh.issues[7] = {"number": 7, "title": title, "body": body}
+        args = st.build_parser().parse_args(
+            ["apply-prepare", "--workspace", str(self.root), "--event-path", str(event), "--run-url", RUN_URL]
+        )
+        return st.cmd_apply_prepare(args, gh)
+
+    def test_other_issue_is_ignored(self):
+        gh = FakeGitHub()
+        self.assertEqual(self.prepare(gh, "hello", title="Bug"), 0)
+        self.assertEqual(self.outputs()["apply"], "false")
+        self.assertEqual(gh.calls, [])
+
+    def test_apply_box_not_ticked(self):
+        gh = FakeGitHub()
+        self.prepare(gh, self.issue_body(tick=["docs-01"], apply=False))
+        self.assertEqual(self.outputs()["apply"], "false")
+        self.assertEqual(gh.calls, [])
+
+    def test_restores_the_run_with_decisions(self):
+        gh = FakeGitHub()
+        self.assertEqual(self.prepare(gh, self.issue_body(tick=["docs-01", "hooks-01"])), 0)
+        out = self.outputs()
+        self.assertEqual((out["apply"], out["run_date"], out["approved"]), ("true", "2026-11-01", "2"))
+
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        report = (run / "report.md").read_text()
+        rows = {
+            line.split("|")[2].strip(): line.split("|")[-2].strip()
+            for line in report.splitlines()
+            if line.startswith("| ") and "---" not in line and "order" not in line
+        }
+        self.assertEqual(rows, {"skills-01": "skip", "docs-01": "accept", "hooks-01": "accept"})
+        self.assertEqual(len(json.loads((run / "items-all.json").read_text())), len(ITEMS))
+        self.assertTrue((run / "crosscheck.json").is_file())
+        latest = json.loads((run.parent / "latest.json").read_text())
+        self.assertEqual(latest["report"], ".notes/stocktake/2026-11-01/report.md")
+
+        # The apply box is unticked at once; the item ticks stay.
+        marks, apply = st.read_marks(gh.issues[7]["body"])
+        self.assertFalse(apply)
+        self.assertTrue(marks["docs-01"])
+        self.assertIn("applying 2", gh.issues[7]["body"])
+
+    def test_apply_with_nothing_ticked(self):
+        gh = FakeGitHub()
+        self.prepare(gh, self.issue_body())
+        self.assertEqual(self.outputs()["apply"], "false")
+        self.assertIn("no item ticked", gh.issues[7]["body"])
+
+    def test_issue_without_data(self):
+        gh = FakeGitHub()
+        body = f"- [x] **{st.APPLY_LABEL}** {st.APPLY_MARKER}"
+        self.assertEqual(self.prepare(gh, body), 1)
+        self.assertEqual(self.outputs()["apply"], "false")
+
+
+class ApplyPublishTest(Base):
+    def setUp(self):
+        super().setUp()
+        data = {"report_date": "2026-11-01", "items": ITEMS}
+        self.gh = FakeGitHub(
+            issues=[{"number": 7, "title": st.ISSUE_TITLE, "body": st.render_body(data, {"docs-01": True})}]
+        )
+        self.git_calls = []
+        self.execution = self.root / "exec.json"
+        self.execution.write_text(
+            json.dumps(
+                [{"type": "assistant"}, {"type": "result", "result": "Applied docs-01. Pending: none."}]
+            )
+        )
+
+    def git(self, log="abc1234 docs: update README"):
+        def run(*args):
+            self.git_calls.append(args)
+            if args[0] == "log":
+                return log
+            return ""
+
+        return run
+
+    def publish(self, git):
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--execution-file",
+                str(self.execution),
+                "--run-url",
+                RUN_URL,
+            ]
+        )
+        return st.cmd_apply_publish(args, self.gh, git)
+
+    def test_opens_one_pr(self):
+        self.assertEqual(self.publish(self.git()), 0)
+        self.assertIn(
+            ("push", "--force", "origin", "refs/heads/stocktake/2026-11-01:refs/heads/claude/stocktake"),
+            self.git_calls,
+        )
+        self.assertIn(("create_pr", "claude/stocktake", "main"), self.gh.calls)
+        pr = self.gh.prs[0]
+        self.assertIn("Merging this pull request is the approval", pr["body"])
+        self.assertIn("docs-01", pr["body"])
+        self.assertNotIn("skills-01", pr["body"])
+        self.assertIn("Applied docs-01", pr["body"])
+        self.assertIn("pull/50", self.gh.issues[7]["body"])
+        self.assertEqual(self.outputs()["pr_url"], "https://github.com/o/r/pull/50")
+
+    def test_updates_the_open_pr(self):
+        self.gh.prs.append(
+            {
+                "number": 50,
+                "head": "claude/stocktake",
+                "title": "old",
+                "body": "old",
+                "html_url": "https://github.com/o/r/pull/50",
+            }
+        )
+        self.publish(self.git())
+        self.assertIn(("update_pr", 50), self.gh.calls)
+        self.assertEqual(len(self.gh.prs), 1)
+        self.assertEqual(self.gh.prs[0]["title"], "Harness stocktake 2026-11-01")
+
+    def test_no_commit_no_push(self):
+        self.assertEqual(self.publish(self.git(log="")), 0)
+        self.assertFalse(any(c[0] == "push" for c in self.git_calls))
+        self.assertEqual(self.gh.prs, [])
+        self.assertIn("made no commit", self.gh.issues[7]["body"])
+
+    def test_missing_branch(self):
+        def git(*args):
+            if args[0] == "rev-parse":
+                raise subprocess.CalledProcessError(128, "git")
+            return ""
+
+        self.assertEqual(self.publish(git), 0)
+        self.assertEqual(self.gh.prs, [])
+
+
+class MarkFailedTest(Base):
+    def test_keeps_report_and_records_failure(self):
+        data = {"report_date": "2026-11-01", "items": ITEMS}
+        gh = FakeGitHub(
+            issues=[{"number": 3, "title": st.ISSUE_TITLE, "body": st.render_body(data, {"docs-01": True})}]
+        )
+        args = st.build_parser().parse_args(
+            ["mark-failed", "--message", "apply failed", "--run-url", RUN_URL]
+        )
+        self.assertEqual(st.cmd_mark_failed(args, gh), 0)
+        body = gh.issues[3]["body"]
+        self.assertIn("apply failed", body)
+        self.assertTrue(st.read_marks(body)[0]["docs-01"])
+        self.assertEqual(st.decode_data(body)["report_date"], "2026-11-01")
+
+
+class GitHubClientTest(unittest.TestCase):
+    def test_find_issue_pages_and_skips_prs(self):
+        gh = st.GitHub("t", "o/r")
+        page1 = [{"number": n, "title": "x"} for n in range(100)]
+        page2 = [
+            {"number": 200, "title": st.ISSUE_TITLE, "pull_request": {}},
+            {"number": 201, "title": st.ISSUE_TITLE},
+        ]
+        with mock.patch.object(gh, "request", side_effect=[page1, page2]) as req:
+            self.assertEqual(gh.find_issue()["number"], 201)
+        self.assertIn("page=2", req.call_args_list[1].args[1])
+
+    def test_request_sends_auth_and_reports_errors(self):
+        gh = st.GitHub("secret-token", "o/r")
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout):
+            seen["auth"] = req.get_header("Authorization")
+            seen["url"] = req.full_url
+            return Resp(b'{"default_branch": "trunk"}')
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            self.assertEqual(gh.default_branch(), "trunk")
+        self.assertEqual(seen, {"auth": "Bearer secret-token", "url": "https://api.github.com/repos/o/r"})
+
+        err = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"no"))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(st.GitHubError):
+                gh.default_branch()
+
+    def test_find_pr_uses_owner_head(self):
+        gh = st.GitHub("t", "o/r")
+        with mock.patch.object(gh, "request", return_value=[]) as req:
+            self.assertIsNone(gh.find_pr("claude/stocktake"))
+        self.assertIn("head=o:claude/stocktake", req.call_args.args[1])
+
+
+class FinalMessageTest(unittest.TestCase):
+    def test_missing_or_bad_file(self):
+        self.assertEqual(st.final_message(""), "")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write("not json")
+        self.addCleanup(os.unlink, fh.name)
+        self.assertEqual(st.final_message(fh.name), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

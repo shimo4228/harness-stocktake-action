@@ -1,0 +1,172 @@
+name: "Harness Stocktake"
+description: "Audit the Claude Code harness in .claude/ with harness-stocktake, track it in one issue, apply what you tick in one PR."
+author: "shimo4228"
+branding:
+  icon: "check-square"
+  color: "orange"
+
+inputs:
+  claude_code_oauth_token:
+    description: "Your Claude Code OAuth token (`claude setup-token`). Set this or anthropic_api_key."
+    required: false
+    default: ""
+  anthropic_api_key:
+    description: "Your Anthropic API key. Set this or claude_code_oauth_token."
+    required: false
+    default: ""
+  github_token:
+    description: "Token for the tracked issue, the branch push and the PR. The workflow's GITHUB_TOKEN is enough."
+    required: false
+    default: ${{ github.token }}
+  mode:
+    description: "`auto` (an `issues` event applies, any other event audits), `audit` or `apply`."
+    required: false
+    default: "auto"
+  plugin_ref:
+    description: "Tag, branch or commit of harness-stocktake to run. Pinned so a plugin release never changes a run unannounced."
+    required: false
+    default: "v0.1.0"
+  plugin_repository:
+    description: "Repository that holds the harness-stocktake marketplace."
+    required: false
+    default: "shimo4228/harness-stocktake"
+  plugin_token:
+    description: "Token that can read plugin_repository. Only needed while that repository is private."
+    required: false
+    default: ${{ github.token }}
+  claude_args:
+    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use."
+    required: false
+    default: >-
+      --allowedTools "Read,Write,Edit,MultiEdit,Glob,Grep,Agent,Task,Skill,TodoWrite,Bash(git:*),Bash(python3:*),Bash(uv:*),Bash(date:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*)"
+
+outputs:
+  mode:
+    description: "`audit` or `apply`, the work this run did"
+    value: ${{ steps.mode.outputs.mode }}
+  issue_number:
+    description: "Number of the tracked issue"
+    value: ${{ steps.sync.outputs.issue_number || steps.prepare.outputs.issue_number }}
+  pr_url:
+    description: "URL of the stocktake PR (apply runs)"
+    value: ${{ steps.publish.outputs.pr_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Choose audit or apply
+      id: mode
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        EVENT_NAME: ${{ github.event_name }}
+        OAUTH: ${{ inputs.claude_code_oauth_token }}
+        API_KEY: ${{ inputs.anthropic_api_key }}
+      run: |
+        if [ -z "$OAUTH" ] && [ -z "$API_KEY" ]; then
+          echo "::error::Set claude_code_oauth_token or anthropic_api_key (your own secret)."
+          exit 1
+        fi
+        case "$MODE" in
+          auto) if [ "$EVENT_NAME" = "issues" ]; then mode=apply; else mode=audit; fi ;;
+          audit|apply) mode="$MODE" ;;
+          *) echo "::error::mode must be auto, audit or apply (got '$MODE')"; exit 1 ;;
+        esac
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "Mode: $mode"
+
+    - name: Read the tracked issue
+      id: prepare
+      if: steps.mode.outputs.mode == 'apply'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" apply-prepare --workspace "$GITHUB_WORKSPACE"
+
+    - name: Fetch harness-stocktake at the pinned ref
+      id: plugin
+      if: steps.mode.outputs.mode == 'audit' || steps.prepare.outputs.apply == 'true'
+      shell: bash
+      env:
+        REPO: ${{ inputs.plugin_repository }}
+        REF: ${{ inputs.plugin_ref }}
+        TOKEN: ${{ inputs.plugin_token }}
+      run: |
+        dir="$RUNNER_TEMP/harness-stocktake-plugin"
+        rm -rf "$dir"
+        git init -q "$dir"
+        git -C "$dir" remote add origin "https://github.com/$REPO.git"
+        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
+        echo "::add-mask::$auth"
+        git -C "$dir" -c http.extraheader="AUTHORIZATION: basic $auth" fetch -q --depth 1 origin "$REF"
+        git -C "$dir" checkout -q FETCH_HEAD
+        echo "Plugin: $REPO@$REF ($(git -C "$dir" rev-parse HEAD))"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+    - name: Audit the harness
+      id: audit
+      if: steps.mode.outputs.mode == 'audit'
+      uses: anthropics/claude-code-action@v1
+      with:
+        prompt: "/harness-stocktake:harness-stocktake --project ."
+        plugin_marketplaces: ${{ steps.plugin.outputs.dir }}
+        plugins: "harness-stocktake@harness-stocktake"
+        display_report: "true"
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        github_token: ${{ inputs.github_token }}
+        claude_args: ${{ inputs.claude_args }}
+
+    - name: Update the tracked issue
+      id: sync
+      if: ${{ !cancelled() && steps.mode.outputs.mode == 'audit' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        EVENT_NAME: ${{ github.event_name }}
+        PLUGIN_REF: ${{ inputs.plugin_ref }}
+      run: |
+        # A pull_request run checks the PR's harness; the issue tracks the default branch.
+        extra=()
+        if [ "$EVENT_NAME" = "pull_request" ]; then extra=(--no-issue); fi
+        python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" audit-sync \
+          --workspace "$GITHUB_WORKSPACE" --plugin-ref "$PLUGIN_REF" "${extra[@]}"
+
+    - name: Apply the ticked items
+      id: apply
+      if: steps.prepare.outputs.apply == 'true'
+      uses: anthropics/claude-code-action@v1
+      with:
+        prompt: >-
+          /harness-stocktake:harness-stocktake --project . apply
+          The author approved .notes/stocktake/${{ steps.prepare.outputs.run_date }}/report.md through the
+          tracked issue; its decision column holds every decision (accept or skip). Run Phase 4 and
+          reply with Phase 5's completion report, then stop: do not merge, rebase or push.
+        plugin_marketplaces: ${{ steps.plugin.outputs.dir }}
+        plugins: "harness-stocktake@harness-stocktake"
+        display_report: "true"
+        claude_code_oauth_token: ${{ inputs.claude_code_oauth_token }}
+        anthropic_api_key: ${{ inputs.anthropic_api_key }}
+        github_token: ${{ inputs.github_token }}
+        claude_args: ${{ inputs.claude_args }}
+
+    - name: Push claude/stocktake and open or update the PR
+      id: publish
+      if: steps.prepare.outputs.apply == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        RUN_DATE: ${{ steps.prepare.outputs.run_date }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        EXECUTION_FILE: ${{ steps.apply.outputs.execution_file }}
+      run: |
+        git fetch -q origin "$DEFAULT_BRANCH"
+        python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" apply-publish \
+          --run-date "$RUN_DATE" --default-branch "$DEFAULT_BRANCH" --execution-file "$EXECUTION_FILE"
+
+    - name: Record a failed apply in the tracked issue
+      if: ${{ failure() && steps.prepare.outputs.apply == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" mark-failed --message "apply failed"

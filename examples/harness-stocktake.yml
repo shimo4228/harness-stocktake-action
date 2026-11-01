@@ -1,0 +1,43 @@
+# Copy to .github/workflows/harness-stocktake.yml in your repository.
+name: Harness stocktake
+
+on:
+  schedule:
+    - cron: "0 7 1 * *" # 07:00 UTC on the 1st of each month
+  workflow_dispatch: # run by hand; also restarts a schedule GitHub paused after 60 idle days
+  pull_request:
+    paths: [".claude/**", "CLAUDE.md"]
+  issues:
+    types: [edited] # ticking "Apply the ticked items" in the tracked issue
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: harness-stocktake
+  cancel-in-progress: false
+
+jobs:
+  stocktake:
+    # Issue edits: only the tracked issue with its apply box ticked.
+    # Pull requests: not from forks (no secrets there), not the stocktake PR itself.
+    if: >-
+      (github.event_name != 'issues' ||
+        (github.event.issue.title == 'Harness stocktake' &&
+         contains(github.event.issue.body, '- [x] **Apply the ticked items**'))) &&
+      (github.event_name != 'pull_request' ||
+        (github.event.pull_request.head.repo.full_name == github.repository &&
+         github.head_ref != 'claude/stocktake'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: shimo4228/harness-stocktake-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # or: anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
