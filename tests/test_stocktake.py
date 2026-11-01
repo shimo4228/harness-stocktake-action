@@ -32,6 +32,12 @@ def item(id_, verdict, target, source="skills", **extra):
     }
 
 
+def _names(changed, args):
+    """A fake `git diff --name-only`: NUL-separated under -z, like git."""
+    names = [n for n in changed.split("\n") if n]
+    return "\0".join(names) + ("\0" if names else "") if "-z" in args else "\n".join(names)
+
+
 ITEMS = [
     item("skills-01", "Retire", ".claude/skills/old/SKILL.md", order=1),
     item("docs-01", "Update", "README.md", source="docs", order=2),
@@ -39,6 +45,25 @@ ITEMS = [
     item("rules-01", "Keep", ".claude/rules/style.md", source="rules", order=4),
     item("skills-02", "Retire", ".claude/skills/x/SKILL.md", order=5, folded_into="skills-01"),
 ]
+
+
+def open_blocks(body):
+    """(fence still open, <details> opened minus closed) for a Markdown body, read like GitHub."""
+    fence = ""
+    details = 0
+    for line in body.splitlines():
+        stripped = line.lstrip(" ")
+        if fence:
+            marks = stripped.rstrip()
+            if marks and marks == fence[0] * len(marks) and len(marks) >= len(fence):
+                fence = ""
+            continue
+        run = len(stripped) - len(stripped.lstrip(stripped[:1])) if stripped[:1] in ("`", "~") else 0
+        if run >= 3 and len(line) - len(stripped) <= 3:
+            fence = stripped[0] * run
+            continue
+        details += line.count("<details>") - line.count("</details>")
+    return bool(fence), details
 
 
 class FakeGitHub:
@@ -465,8 +490,10 @@ class ApplyPublishTest(Base):
             self.git_calls.append(args)
             if args[0] == "for-each-ref":
                 return branches
+            if "--name-only" in args:
+                return _names(changed, args)
             if args[0] == "log":
-                return changed if "--name-only" in args else log
+                return log
             return ""
 
         return run
@@ -654,6 +681,16 @@ class ItemStatusTest(unittest.TestCase):
             {"status": "pending", "note": "needs a choice", "diff": "-a\n+b", "partial": ["CLAUDE.md"]},
         )
 
+    def test_a_note_without_an_outcome_still_warns_about_a_shared_file(self):
+        approved = [SMOKE_ITEMS[2], SMOKE_ITEMS[3]]
+        outcomes = {"docs-03": {"note": "Rewrote the build section."}}
+        status = st.item_status(approved, {"CLAUDE.md"}, outcomes)
+        self.assertEqual(status["docs-03"]["status"], "applied")
+        self.assertEqual(status["docs-03"]["shared"], ["docs-01"])
+        self.assertEqual(status["docs-01"]["shared"], ["docs-03"])
+        claimed = st.item_status(approved, {"CLAUDE.md"}, {"docs-03": {"outcome": "applied"}})
+        self.assertNotIn("shared", claimed["docs-03"])
+
     def test_directories_and_globs(self):
         retire_dir = item("skills-09", "Retire", ".claude/skills/old")
         glob = item("skills-08", "Retire", ".claude/skills/pack-*/SKILL.md")
@@ -714,8 +751,10 @@ class SmokePublishTest(Base):
 
     def git(self, log, changed):
         def run(*args):
+            if "--name-only" in args:
+                return _names(changed, args)
             if args[0] == "log":
-                return changed if "--name-only" in args else log
+                return log
             return {"for-each-ref": "stocktake/2026-11-01"}.get(args[0], "")
 
         return run
@@ -781,12 +820,147 @@ class SmokePublishTest(Base):
 
         def git(*args):
             calls.append(args)
-            if args[0] == "log" and "--name-only" in args:
-                return "CLAUDE.md\n.notes/stocktake/2026-11-01/outcomes.json\n"
+            if "--name-only" in args:
+                return "CLAUDE.md\0.notes/stocktake/2026-11-01/outcomes.json\0"
             return ""
 
         self.assertEqual(st.changed_files(git, "main", "stocktake/x"), {"CLAUDE.md"})
-        self.assertIn("origin/main..stocktake/x", calls[0])
+        # The branch's net change since it left main: three dots, not every commit's files.
+        self.assertIn("origin/main...stocktake/x", calls[0])
+
+    def real_git(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        env = {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.com",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def git(*args):
+            return st.run_git("-C", str(repo), *args)
+
+        git("init", "-q", "-b", "main")
+        (repo / "README.md").write_text("readme\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("checkout", "-q", "-b", "stocktake/2026-11-01")
+        return repo, git
+
+    def test_changed_files_keep_non_ascii_paths(self):
+        repo, git = self.real_git()
+        (repo / "docs").mkdir()
+        (repo / "docs" / "設計.md").write_text("design\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "docs: design note")
+        changed = st.changed_files(git, "main", "stocktake/2026-11-01")
+        self.assertEqual(changed, {"docs/設計.md"})
+        design = item("docs-07", "Update", "docs/設計.md", source="docs")
+        self.assertEqual(st.item_status([design], changed, {})["docs-07"]["status"], "applied")
+
+    def test_changed_files_are_the_net_diff(self):
+        repo, git = self.real_git()
+        (repo / "README.md").write_text("changed\n")
+        (repo / "CLAUDE.md").write_text("rules\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "edit")
+        (repo / "README.md").write_text("readme\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "revert README")
+        self.assertEqual(st.changed_files(git, "main", "stocktake/2026-11-01"), {"CLAUDE.md"})
+
+    def test_pending_diff_is_shown_verbatim(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        diff = "-  <!-- old -->\n+  <!-- new --> cc @alice\n+```\n"
+        (run / st.OUTCOMES_FILE).write_text(json.dumps({"hooks-03": {"outcome": "pending", "diff": diff}}))
+        self.publish()
+        body = self.gh.prs[0]["body"]
+        self.assertIn("````diff\n" + diff.rstrip("\n") + "\n````", body)
+        self.assertEqual(open_blocks(body), (False, 0))
+
+    def test_fallback_change_is_shown_verbatim(self):
+        smoke = [dict(i) for i in SMOKE_ITEMS]
+        smoke[1]["change"] = 'Drop the hook: `"command": "x --> y"` (ask @bob)'
+        data = {"report_date": "2026-11-01", "items": smoke}
+        ticked = {"hooks-02": True, "hooks-03": True, "docs-01": True}
+        self.gh.issues[1]["body"] = st.render_body(data, ticked)
+        self.publish()
+        body = self.gh.prs[0]["body"]
+        self.assertIn("```\n" + smoke[1]["change"] + "\n```", body)
+
+    def publish_big(self, notes="", diff="", report="", log="abc x"):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True, exist_ok=True)
+        ids = ("hooks-02", "hooks-03", "docs-01")
+        outcomes = {i: {"outcome": "pending", "note": notes, "diff": diff} for i in ids}
+        (run / st.OUTCOMES_FILE).write_text(json.dumps(outcomes))
+        execution = self.root / "exec.json"
+        execution.write_text(json.dumps([{"type": "result", "result": report}]))
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--workspace",
+                str(self.root),
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--run-url",
+                RUN_URL,
+                "--issue-number",
+                "1",
+                "--execution-file",
+                str(execution),
+            ]
+        )
+        self.assertEqual(st.cmd_apply_publish(args, self.gh, self.git(log, "CLAUDE.md")), 0)
+        body = self.gh.prs[0]["body"]
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        return body
+
+    def test_long_notes_are_shortened_before_the_report_goes(self):
+        big = "\n".join(f"-line {n} " + "x" * 80 for n in range(400))  # ~36k
+        body = self.publish_big(notes="n" * 20_000, diff=big, report="r" * 60_000)
+        self.assertNotIn("n" * 20_000, body)
+        self.assertIn("### Completion report", body)
+        self.assertEqual(open_blocks(body), (False, 0))
+
+    def test_no_pointer_to_a_section_the_body_dropped(self):
+        big = "\n".join(f"-line {n} " + "x" * 80 for n in range(400))
+        log = "\n".join(f"{n:07x} commit" for n in range(6_000))  # ~90k: only the final cut fits
+        body = self.publish_big(notes="n" * 20_000, diff=big, report="r" * 60_000, log=log)
+        self.assertNotIn("### Completion report", body)
+        self.assertNotIn("see the completion report", body)
+        self.assertNotIn("completion report may say more", body)
+        self.assertIn("cut to fit GitHub's limit", body)
+        self.assertEqual(open_blocks(body), (False, 0))
+
+    def test_a_cut_report_keeps_its_details_closed(self):
+        report = "Summary\n\n```diff\n" + "+x\n" * 30_000
+        body = self.publish_big(report=report)
+        self.assertIn("### Completion report", body)
+        self.assertEqual(open_blocks(body), (False, 0))
+
+    def test_close_blocks_after_a_cut(self):
+        text = "<details><summary>s</summary>\n\n````diff\n+a\n```\n+b"
+        closed = st._close_blocks(text)
+        self.assertTrue(closed.startswith(text))
+        self.assertEqual(open_blocks(closed), (False, 0))
+        self.assertEqual(st._close_blocks("done\n```\nx\n```\n"), "done\n```\nx\n```\n")
+
+    def test_final_cut_fits_with_a_long_closing_fence(self):
+        log = "`" * 400 + "\n" + "\n".join(f"{n:07x} commit" for n in range(6_000))
+        body = self.publish_big(log=log)
+        self.assertIn("cut to fit GitHub's limit", body)
+        self.assertEqual(open_blocks(body), (False, 0))
 
     def test_changed_files_failure_warns(self):
         def git(*args):

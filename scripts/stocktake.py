@@ -368,7 +368,9 @@ def item_status(approved: list[Item], changed: set[str], outcomes: dict[str, Ite
                     f"Only part of it is on this branch ({', '.join(sorted(hits[id_]))}); still to do: "
                     f"{left}. Finish it by hand."
                 )
-        if applied and not record:
+        if applied and claimed != "applied":
+            # No explicit claim for this item, yet its file also belongs to another one: the change
+            # on the branch may be the other item's alone.
             shared = sorted({o for f in hits[id_] for o in owners[f]} - {id_})
             if shared:
                 entry["shared"] = shared
@@ -843,18 +845,27 @@ def apply_branch(git: Git, base: str, run_date: str) -> tuple[str, str]:
 
 
 def changed_files(git: Git, base: str, ref: str) -> set[str]:
-    """Paths the branch's commits add, change or delete (renames as both old and new path).
+    """Paths that merging the branch adds, changes or deletes (renames as both old and new path).
 
-    The same range as the commit list, so it needs no merge base. The run's own notes under
-    .notes/ are not part of any item.
+    The net diff from where the branch left the default branch, so a file a commit changed and a
+    later commit put back is not in it. Names come NUL-separated and unquoted, so a non-ASCII path
+    reads as itself. The run's own notes under .notes/ are not part of any item.
     """
     try:
-        out = git("log", "--name-only", "--no-renames", "--format=", f"origin/{base}..{ref}")
+        out = git(
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            f"origin/{base}...{ref}",
+        )
     except subprocess.CalledProcessError as err:
         print(f"::warning::Could not list the branch's files ({err}); every item reads as pending.")
         return set()
     root = f"{REPORT_ROOT.parts[0]}/"
-    return {ln.strip() for ln in out.splitlines() if ln.strip() and not ln.strip().startswith(root)}
+    return {n for n in out.split("\0") if n.strip() and not n.startswith(root)}
 
 
 def _fence(text: str, lang: str = "") -> list[str]:
@@ -862,6 +873,35 @@ def _fence(text: str, lang: str = "") -> list[str]:
     longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
     fence = "`" * max(3, longest + 1)
     return [f"{fence}{lang}", text.rstrip("\n"), fence]
+
+
+_FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _close_blocks(text: str) -> str:
+    """Text cut at an arbitrary point, with any code fence and <details> it left open closed again."""
+    fence = ""
+    details = 0
+    for line in text.splitlines():
+        m = _FENCE_LINE.match(line)
+        if fence:
+            closes = m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+            if closes and not line[m.end() :].strip():
+                fence = ""
+            continue
+        if m:
+            fence = m.group(1)
+            continue
+        details += line.count("<details>") - line.count("</details>")
+    tail = ""
+    if fence:
+        tail += f"\n{fence}"
+    tail += "\n</details>" * max(details, 0)
+    return f"{text}{tail}\n" if tail else text
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(limit - 1, 0)].rstrip() + "…"
 
 
 def pr_body(
@@ -875,7 +915,15 @@ def pr_body(
     report: str,
     diff_limit: int = 20_000,
     report_limit: int = 40_000,
+    note_limit: int = 20_000,
 ) -> str:
+    """The PR body. The limits shorten it to fit; nothing in it points at a section they removed."""
+    has_report = bool(report) and report_limit > 0
+    elsewhere = (
+        "see the completion report below (the full one is in the run's summary)"
+        if has_report
+        else "the run's summary holds the full completion report"
+    )
     applied = [i for i in approved if status[str(i["id"])]["status"] == "applied"]
     pending = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
     lines = [
@@ -922,38 +970,47 @@ def pr_body(
             entry = status[str(i["id"])]
             lines += [f"#### {_label(i)}", ""]
             if entry.get("note"):
-                lines += [_neutralise(entry["note"]), ""]
+                lines += [_neutralise(_clip(entry["note"], note_limit)), ""]
             if entry.get("partial"):
                 lines += [
                     f"Partly on this branch: {', '.join(f'`{_inline(f, 120)}`' for f in entry['partial'])}.",
                     "",
                 ]
+            # A code block shows the diff as written, so it is not neutralised: GitHub neither
+            # mentions anyone nor opens a comment from inside one, and the author applies it by hand.
+            change = str(i.get("change") or "(none)")
             if entry.get("diff") and len(entry["diff"]) <= diff_limit:
-                lines += [*_fence(_neutralise(entry["diff"]), "diff"), ""]
+                lines += [*_fence(entry["diff"], "diff"), ""]
             elif entry.get("diff"):
                 lines += [
                     (
                         f"The diff ({len(entry['diff'])} characters) is too long for this pull request; "
-                        "see the completion report."
+                        f"{elsewhere}."
                     ),
+                    "",
+                ]
+            elif len(change) <= diff_limit:
+                more = "; the completion report below may say more" if has_report else ""
+                lines += [
+                    f"The apply run recorded no diff for it. The approved change is below{more}.",
+                    "",
+                    *_fence(change),
                     "",
                 ]
             else:
                 lines += [
                     (
-                        "The apply run recorded no diff for it. The approved change is below; the "
-                        "completion report may say more."
+                        f"The apply run recorded no diff for it, and the approved change ({len(change)} "
+                        f"characters) is too long for this pull request; {elsewhere}."
                     ),
-                    "",
-                    *_fence(_neutralise(str(i.get("change") or "(none)")[:diff_limit])),
                     "",
                 ]
     if log:
         lines += ["", "### Commits", "", *_fence(log), ""]
-    if report:
+    if has_report:
         cut = report[:report_limit]
         if len(report) > report_limit:
-            cut += "\n\n… (cut; the full report is in the run's summary)"
+            cut = _close_blocks(cut) + "\n\n… (cut; the full report is in the run's summary)"
         lines += [
             "### Completion report",
             "",
@@ -991,8 +1048,9 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
     git("push", "--force", "origin", f"refs/heads/{local}:refs/heads/{args.branch}")
 
     report = final_message(args.execution_file)
-    # GitHub caps a PR body like an issue body: shorten the diffs, then the report, until it fits.
-    for diff_limit, report_limit in ((20_000, 40_000), (8_000, 15_000), (3_000, 5_000), (0, 0)):
+    # GitHub caps a PR body like an issue body: shorten the diffs, notes and report until it fits.
+    tiers = ((20_000, 40_000, 20_000), (8_000, 15_000, 4_000), (3_000, 5_000, 1_000), (0, 0, 300))
+    for diff_limit, report_limit, note_limit in tiers:
         body = pr_body(
             data,
             approved,
@@ -1004,11 +1062,17 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
             report,
             diff_limit,
             report_limit,
+            note_limit,
         )
         if len(body) <= MAX_BODY:
             break
     else:
-        body = body[: MAX_BODY - 40] + "\n\n… (cut to fit GitHub's limit)\n"
+        # Still too long (a very long commit list): cut, then close what the cut left open.
+        tail = "\n\n… (cut to fit GitHub's limit)\n"
+        size = MAX_BODY - len(tail)
+        while len(closed := _close_blocks(body[:size]) + tail) > MAX_BODY:
+            size -= len(closed) - MAX_BODY
+        body = closed
     title = f"Harness stocktake {data.get('report_date')}"
 
     pr = gh.find_pr(args.branch)
