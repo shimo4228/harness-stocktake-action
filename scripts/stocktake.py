@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import fnmatch
 import gzip
 import json
 import os
@@ -43,6 +44,7 @@ PR_BRANCH = "claude/stocktake"
 REPORT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WRITE_PERMISSIONS = {"admin", "maintain", "write"}
 REPORT_ROOT = Path(".notes/stocktake")
+OUTCOMES_FILE = "outcomes.json"  # the apply run writes it next to report.md
 
 GROUPS = ["Retire", "Merge / demote", "Improve / update", "Other", "Keep"]
 _GROUP_PREFIXES = [
@@ -51,6 +53,55 @@ _GROUP_PREFIXES = [
     ("Improve / update", ("improve", "update", "append", "revise", "create")),
     ("Keep", ("keep", "out of scope", "already covered", "too specific")),
 ]
+
+README_URL = "https://github.com/shimo4228/harness-stocktake-action#what-it-cant-change"
+
+# Claude Code's protected paths (https://code.claude.com/docs/en/permission-modes#protected-paths).
+# In a `-p` run its Edit and Write tools are denied there whatever --allowedTools allows, so an
+# item that edits one is applied by hand.
+PROTECTED_DIRS = {".git", ".vscode", ".idea", ".husky", ".cargo", ".devcontainer", ".yarn", ".mvn", ".claude"}
+PROTECTED_EXEMPT = (".claude/worktrees/", ".claude/agent-memory/")
+PROTECTED_FILES = {
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_aliases",
+    ".bash_logout",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".profile",
+    ".envrc",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnp.cjs",
+    ".pnp.loader.mjs",
+    ".pnpmfile.cjs",
+    "bunfig.toml",
+    ".bunfig.toml",
+    ".bazelrc",
+    ".bazelversion",
+    ".bazeliskrc",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+    "gradle-wrapper.properties",
+    "maven-wrapper.properties",
+    ".devcontainer.json",
+    ".ripgreprc",
+    "pyrightconfig.json",
+    ".mcp.json",
+    ".claude.json",
+}
+# Config files whose items edit entries in them, so even a Retire is an edit.
+CONFIG_FILES = {".claude/settings.json", ".claude/settings.local.json"}
 
 CHECKBOX = re.compile(r"^- \[(?P<mark>[ xX])\] `(?P<id>[^`]+)`")
 APPLY_LINE = re.compile(r"^- \[(?P<mark>[ xX])\] \*\*" + re.escape(APPLY_LABEL) + r"\*\*")
@@ -226,6 +277,98 @@ def acting_items(items: list[Item]) -> list[Item]:
     ]
 
 
+def item_paths(item: Item) -> list[str]:
+    """The repo-relative paths an item acts on: `targets` for a grouped item, else `target`."""
+    raw = item.get("targets") or [item.get("target")]
+    paths = []
+    for p in raw if isinstance(raw, list) else [raw]:
+        s = str(p or "").strip()
+        while s.startswith("./"):
+            s = s[2:]
+        if s:
+            paths.append(s)
+    return paths
+
+
+def is_protected(path: str) -> bool:
+    """True for a path Claude Code's Edit and Write tools may not touch in a `-p` run."""
+    if path.startswith(PROTECTED_EXEMPT):
+        return False
+    parts = path.split("/")
+    if any(part in PROTECTED_DIRS for part in parts[:-1]) or path.startswith(".config/git/"):
+        return True
+    return parts[-1] in PROTECTED_FILES or parts[-1] in PROTECTED_DIRS
+
+
+def needs_hand(item: Item) -> bool:
+    """An item the Action cannot apply: it edits a protected path.
+
+    A Retire of a protected file is a `git rm`, which Claude Code allows, unless the file is a
+    config whose entries the item edits (`.claude/settings.json`).
+    """
+    paths = item_paths(item)
+    if any(p in CONFIG_FILES or p.split("/")[-1] in PROTECTED_FILES for p in paths):
+        return True
+    return verdict_group(str(item.get("verdict", ""))) != "Retire" and any(map(is_protected, paths))
+
+
+def touches(item: Item, changed: set[str]) -> list[str]:
+    """The changed files that belong to an item: its paths, files under them, or glob matches."""
+    hits = set()
+    for t in item_paths(item):
+        if any(c in t for c in "*?["):
+            hits.update(c for c in changed if fnmatch.fnmatchcase(c, t))
+        else:
+            prefix = t.rstrip("/") + "/"
+            hits.update(c for c in changed if c == t or c.startswith(prefix))
+    return sorted(hits)
+
+
+def item_status(approved: list[Item], changed: set[str], outcomes: dict[str, Item]) -> dict[str, Item]:
+    """applied / pending per approved item, from what the branch changed.
+
+    The branch decides: an item whose files the branch leaves alone is pending, whatever the
+    apply run says. outcomes.json, the apply run's own record, can only move an item to pending
+    and add its note and diff.
+    """
+    hits = {str(i["id"]): touches(i, changed) for i in approved}
+    status: dict[str, Item] = {}
+    for i in approved:
+        id_ = str(i["id"])
+        record = outcomes.get(id_) or {}
+        claimed = str(record.get("outcome", "")).strip().lower()
+        applied = bool(hits[id_]) and claimed not in ("pending", "skipped")
+        entry: Item = {"status": "applied" if applied else "pending"}
+        for key in ("note", "diff"):
+            if record.get(key):
+                entry[key] = str(record[key])[:20_000]
+        if applied and not record:
+            shared = sorted(o for o, h in hits.items() if o != id_ and set(h) & set(hits[id_]))
+            if shared:
+                entry["shared"] = shared
+        status[id_] = entry
+    return status
+
+
+def load_outcomes(path: Path) -> dict[str, Item]:
+    """outcomes.json from the apply run: {id: {outcome, note, diff}}. Anything else reads as empty."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if isinstance(raw, list):
+        raw = {str(r.get("id")): r for r in raw if isinstance(r, dict) and r.get("id")}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Item] = {}
+    for k, v in raw.items():
+        if isinstance(v, str):
+            v = {"outcome": v}
+        if isinstance(v, dict):
+            out[str(k)] = v
+    return out
+
+
 def item_key(item: Item) -> str:
     """Carries a decision from one report to the next: ids are stable only within a run."""
     return f"{item.get('source')}|{item.get('target')}|{item.get('verdict')}"
@@ -296,6 +439,37 @@ def _first_sentence(text: object) -> str:
     return m.group(1) if m else s
 
 
+TAG_APPLIED = "✅ *applied*"
+TAG_PENDING = "✋ **pending, apply by hand**"
+TAG_HAND = "✋ *by hand*"
+
+
+def _status_tag(item: Item, outcomes: dict[str, Item]) -> str:
+    """Where an item stands: after an apply its result, before one whether it needs a hand edit."""
+    status = (outcomes.get(str(item["id"])) or {}).get("status")
+    if status == "applied":
+        return f" · {TAG_APPLIED}"
+    if status == "pending":
+        return f" · {TAG_PENDING}"
+    return f" · {TAG_HAND}" if needs_hand(item) else ""
+
+
+def _kept_lines(keep: list[Item]) -> list[str]:
+    """One line per kept path. Several sources may keep the same file; each is named once."""
+    by_target: dict[str, dict[str, list[str]]] = {}
+    for i in keep:
+        verdicts = by_target.setdefault(_inline(i.get("target"), 120), {})
+        sources = verdicts.setdefault(_inline(i.get("verdict"), 60), [])
+        source = _inline(i.get("source"), 40)
+        if source and source not in sources:
+            sources.append(source)
+    lines = []
+    for target, verdicts in by_target.items():
+        said = " · ".join(f"{v} ({', '.join(s)})" if s else v for v, s in verdicts.items())
+        lines.append(f"- `{target}` — {said}")
+    return lines
+
+
 def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
     items = data.get("items", [])
     acting = acting_items(items)
@@ -343,6 +517,25 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
             ),
             "",
         ]
+        outcomes = data.get("outcomes") or {}
+        if outcomes:
+            lines += [
+                (
+                    f"After the last apply: {TAG_APPLIED} means the item's files changed on "
+                    f"`claude/stocktake`; {TAG_PENDING} means they did not, and the pull request "
+                    "says what to apply by hand."
+                ),
+                "",
+            ]
+        if any(needs_hand(i) and str(i["id"]) not in outcomes for i in acting):
+            lines += [
+                (
+                    f"{TAG_HAND}: Claude Code cannot edit this path inside the Action "
+                    f"([why]({README_URL})). Tick it and the pull request lists it as pending, with "
+                    "the diff when the apply run recorded one, for you to apply."
+                ),
+                "",
+            ]
         budget = MAX_VISIBLE - sum(len(ln) + 1 for ln in lines)
         hidden = 0
         for group in GROUPS[:-1]:
@@ -354,7 +547,8 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
                 mark = "x" if ticked.get(str(i["id"])) else " "
                 n = len(i.get("targets") or [])
                 extra = f" (+{n - 1} more)" if n > 1 else ""
-                line = f"- [{mark}] {_label(i)}{extra} — {_inline(_first_sentence(i.get('reason')))}"
+                tag = _status_tag(i, outcomes)
+                line = f"- [{mark}] {_label(i)}{extra}{tag} — {_inline(_first_sentence(i.get('reason')))}"
                 if budget - len(line) - 1 < 0:
                     hidden += 1
                     continue
@@ -373,7 +567,7 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
         lines += ["---", "", f"- [ ] **{APPLY_LABEL}** {APPLY_MARKER}", ""]
     if keep:
         lines += ["<details><summary>Kept items</summary>", ""]
-        lines += [f"- `{_inline(i.get('target'), 120)}` — {_inline(i.get('verdict'), 60)}" for i in keep]
+        lines += _kept_lines(keep)
         lines += ["", "</details>", ""]
     lines.append("The full report, with each item's evidence and change, is in the run's summary.")
     return _with_data(lines, data)
@@ -541,6 +735,7 @@ def cmd_apply_prepare(args: argparse.Namespace, gh: GitHub) -> int:
 
     # Untick the apply box at once, so a second edit does not start a second apply.
     data.pop("note", None)
+    data.pop("outcomes", None)
     if approved:
         data["last_run"] = stamp(args.run_url, f"applying {len(approved)} ticked item(s)")
     else:
@@ -558,6 +753,7 @@ def cmd_apply_prepare(args: argparse.Namespace, gh: GitHub) -> int:
     if data.get("crosscheck") is not None:
         (run / "crosscheck.json").write_text(json.dumps(data["crosscheck"], ensure_ascii=False, indent=2))
     (run / "report.md").write_text(report_markdown(data, marks))
+    (run / OUTCOMES_FILE).unlink(missing_ok=True)
     latest = {
         "report": str(REPORT_ROOT / data["report_date"] / "report.md"),
         "date": data["report_date"],
@@ -616,41 +812,93 @@ def apply_branch(git: Git, base: str, run_date: str) -> tuple[str, str]:
     return "", ""
 
 
-def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) -> int:
-    issue = tracked_issue(gh, args.issue_number)
-    if issue is None:
-        print("::error::The tracked issue is gone.")
-        return 1
-    data = decode_data(issue["body"] or "") or {}
-    marks, _ = read_marks(issue["body"] or "")
-    base = args.default_branch or gh.default_branch()
-    local, log = apply_branch(git, base, args.run_date)
-    if not log:
-        data["last_run"] = stamp(args.run_url, "apply made no commit")
-        data["note"] = "The apply run made no commit; see the run log for the pending items."
-        gh.update_issue(issue["number"], render_body(data, marks))
-        print("::warning::The apply run made no commit.")
-        return 0
+def changed_files(git: Git, base: str, ref: str) -> set[str]:
+    """Paths the branch adds, changes or deletes against the default branch (renames as both)."""
+    try:
+        out = git("diff", "--name-only", "--no-renames", f"origin/{base}...{ref}")
+    except subprocess.CalledProcessError:
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
 
-    git("push", "--force", "origin", f"refs/heads/{local}:refs/heads/{args.branch}")
 
-    approved = [i for i in acting_items(data.get("items", [])) if marks.get(str(i["id"]))]
+def _fence(text: str, lang: str = "") -> list[str]:
+    """A code block whose fence is longer than any backtick run inside it."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [f"{fence}{lang}", text.rstrip("\n"), fence]
+
+
+def pr_body(
+    data: dict[str, Any],
+    approved: list[Item],
+    status: dict[str, Item],
+    issue_number: int,
+    run_url: str,
+    branch: str,
+    log: str,
+    report: str,
+) -> str:
+    applied = [i for i in approved if status[str(i["id"])]["status"] == "applied"]
+    pending = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
     lines = [
         (
             f"Harness stocktake of {data.get('report_date')}: {len(approved)} approved item(s), "
-            f"applied on `{args.branch}`."
+            f"{len(applied)} applied on `{branch}`, {len(pending)} left for you to apply by hand."
         ),
         "",
         "**Merging this pull request is the approval.** Nothing reached the default branch before it.",
         "",
-        f"Tracked issue: #{issue['number']} · [run]({args.run_url})",
+        f"Tracked issue: #{issue_number} · [run]({run_url})",
         "",
         "### Approved items",
         "",
+        f"**Applied on this branch ({len(applied)})**: the item's files change in this pull request.",
+        "",
     ]
-    lines += [f"- {_label(i)}" for i in approved]
-    lines += ["", "### Commits", "", "```", log, "```", ""]
-    report = final_message(args.execution_file)
+    for i in applied:
+        shared = status[str(i["id"])].get("shared")
+        also = (
+            f" — shares its file with {', '.join(f'`{_inline(s, 60)}`' for s in shared)}; check the diff"
+            if shared
+            else ""
+        )
+        lines.append(f"- {_label(i)}{also}")
+    if not applied:
+        lines.append("- none")
+    lines += [
+        "",
+        (
+            f"**Pending, apply by hand ({len(pending)})**: this pull request does not change the "
+            "item's files. Merging it leaves them as they are."
+        ),
+        "",
+    ]
+    for i in pending:
+        hand = " · Claude Code cannot edit this path in the Action" if needs_hand(i) else ""
+        lines.append(f"- {_label(i)}{hand} — see [Pending items](#pending-items)")
+    if not pending:
+        lines.append("- none")
+    if pending:
+        lines += ["", "### Pending items", ""]
+        for i in pending:
+            entry = status[str(i["id"])]
+            lines += [f"#### {_label(i)}", ""]
+            if entry.get("note"):
+                lines += [_neutralise(entry["note"]), ""]
+            if entry.get("diff"):
+                lines += [*_fence(_neutralise(entry["diff"]), "diff"), ""]
+            else:
+                lines += [
+                    (
+                        "The apply run recorded no diff for it. The approved change is below; the "
+                        "completion report may say more."
+                    ),
+                    "",
+                    *_fence(_neutralise(i.get("change") or "(none)")),
+                    "",
+                ]
+    if log:
+        lines += ["", "### Commits", "", *_fence(log), ""]
     if report:
         lines += [
             "### Completion report",
@@ -662,13 +910,51 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
             "</details>",
             "",
         ]
-    body = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) -> int:
+    issue = tracked_issue(gh, args.issue_number)
+    if issue is None:
+        print("::error::The tracked issue is gone.")
+        return 1
+    data = decode_data(issue["body"] or "") or {}
+    marks, _ = read_marks(issue["body"] or "")
+    base = args.default_branch or gh.default_branch()
+    approved = [i for i in acting_items(data.get("items", [])) if marks.get(str(i["id"]))]
+    outcomes = load_outcomes(Path(args.workspace) / REPORT_ROOT / args.run_date / OUTCOMES_FILE)
+    local, log = apply_branch(git, base, args.run_date)
+    changed = changed_files(git, base, local) if log else set()
+    status = item_status(approved, changed, outcomes)
+    data["outcomes"] = {k: {"status": v["status"]} for k, v in status.items()}
+    if not log:
+        data["last_run"] = stamp(args.run_url, "apply made no commit")
+        data["note"] = "The apply run made no commit, so every ticked item is pending; see the run log."
+        gh.update_issue(issue["number"], render_body(data, marks))
+        print("::warning::The apply run made no commit.")
+        return 0
+
+    git("push", "--force", "origin", f"refs/heads/{local}:refs/heads/{args.branch}")
+
+    body = pr_body(
+        data,
+        approved,
+        status,
+        issue["number"],
+        args.run_url,
+        args.branch,
+        log,
+        final_message(args.execution_file),
+    )
     title = f"Harness stocktake {data.get('report_date')}"
 
     pr = gh.find_pr(args.branch)
     pr = gh.update_pr(pr["number"], title, body) if pr else gh.create_pr(args.branch, base, title, body)
+    n_applied = sum(1 for v in status.values() if v["status"] == "applied")
     data["pr_url"] = pr["html_url"]
-    data["last_run"] = stamp(args.run_url, f"applied {len(approved)} item(s)")
+    data["last_run"] = stamp(
+        args.run_url, f"applied {n_applied} of {len(approved)} item(s), {len(approved) - n_applied} pending"
+    )
     data.pop("note", None)
     gh.update_issue(issue["number"], render_body(data, marks))
     print(f"Pull request: {pr['html_url']}")
@@ -700,6 +986,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--branch", default=PR_BRANCH)
     c.add_argument("--default-branch", default="")
     c.add_argument("--execution-file", default="")
+    c.add_argument("--workspace", default=".")
 
     d = sub.add_parser("mark-failed")
     d.add_argument("--message", required=True)

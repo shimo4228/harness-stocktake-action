@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ${{ github.token }}
   claude_args:
-    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use."
+    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use. No allow rule lets Claude Code edit .claude/ (see README, What it can't change)."
     required: false
     default: >-
       --allowedTools "Read,Write,Edit,MultiEdit,Glob,Grep,Agent,Task,Skill,TodoWrite,Bash(git:*),Bash(python3:*),Bash(uv:*),Bash(date:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*)"
@@ -139,9 +139,31 @@ runs:
       with:
         prompt: >-
           /harness-stocktake:harness-stocktake --project . apply
+
           The author approved .notes/stocktake/${{ steps.prepare.outputs.run_date }}/report.md through the
-          tracked issue; its decision column holds every decision (accept or skip). Run Phase 4 and
-          reply with Phase 5's completion report, then stop: do not merge, rebase or push.
+          tracked issue; its decision column holds every decision (accept or skip).
+
+          This run is a GitHub Actions job, not a local session. When you finish, the Action pushes
+          the commits on your stocktake/<date> branch to `claude/stocktake` and opens or updates one
+          pull request. The author merging that pull request is the approval: it stands in for
+          Phase 5's GO, the rebase and the ff-only merge. Nothing runs after the merge, so an item
+          Phase 4 would hold for "after merge" is pending here. Run Phase 4, then stop: do not merge,
+          rebase or push, and keep the branch.
+
+          Claude Code denies Edit and Write on its protected paths in this run (the .claude/
+          directory, .mcp.json and the others its docs list), whatever the allowed tools say. When an
+          item needs such an edit, do not write the file another way: leave it unchanged and record
+          the item as pending, with the exact unified diff you would have applied.
+
+          Before you reply, write .notes/stocktake/${{ steps.prepare.outputs.run_date }}/outcomes.json:
+          a JSON object with one key per accepted item id, each value
+          {"outcome": "applied" | "reevaluated" | "pending" | "skipped", "note": "<one or two
+          sentences>", "diff": "<the unified diff for a pending item, else empty>"}.
+
+          Then reply with Phase 5's completion report, written for the pull request's reader: the
+          commits, every pending item with its question and its diff, every applied_diff, and every
+          decision made on the author's behalf. Do not mention worktree paths, the ff-only merge,
+          pushing, or what happens after a GO; the Action and the merge cover those.
         plugin_marketplaces: ${{ steps.plugin.outputs.dir }}
         plugins: "harness-stocktake@harness-stocktake"
         display_report: "true"
@@ -164,7 +186,7 @@ runs:
         git fetch -q origin "$DEFAULT_BRANCH"
         python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" apply-publish \
           --run-date "$RUN_DATE" --default-branch "$DEFAULT_BRANCH" --execution-file "$EXECUTION_FILE" \
-          --issue-number "$ISSUE_NUMBER"
+          --issue-number "$ISSUE_NUMBER" --workspace "$GITHUB_WORKSPACE"
 
     - name: Record a failed apply in the tracked issue
       if: ${{ failure() && steps.prepare.outputs.apply == 'true' }}
