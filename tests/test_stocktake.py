@@ -466,9 +466,7 @@ class ApplyPublishTest(Base):
             if args[0] == "for-each-ref":
                 return branches
             if args[0] == "log":
-                return log
-            if args[0] == "diff":
-                return changed
+                return changed if "--name-only" in args else log
             return ""
 
         return run
@@ -600,6 +598,9 @@ class ProtectedPathTest(unittest.TestCase):
         grouped = item("x-01", "Update", "group", targets=["README.md", ".claude/rules/a.md"])
         self.assertTrue(st.needs_hand(grouped))
         self.assertTrue(st.needs_hand(item("x-02", "Retire", ".mcp.json")))
+        self.assertTrue(st.needs_hand(item("x-03", "Retire", "packages/app/.claude/settings.json")))
+        self.assertFalse(st.needs_hand(item("x-04", "Retire", ".pre-commit-config.yaml")))
+        self.assertTrue(st.needs_hand(item("x-05", "Update", ".pre-commit-config.yaml")))
 
 
 class IssueTagsTest(unittest.TestCase):
@@ -648,7 +649,10 @@ class ItemStatusTest(unittest.TestCase):
         status = st.item_status(approved, {"CLAUDE.md"}, outcomes)
         self.assertEqual(status["docs-01"]["status"], "applied")
         self.assertEqual(status["docs-01"]["shared"], ["docs-03"])
-        self.assertEqual(status["docs-03"], {"status": "pending", "note": "needs a choice", "diff": "-a\n+b"})
+        self.assertEqual(
+            status["docs-03"],
+            {"status": "pending", "note": "needs a choice", "diff": "-a\n+b", "partial": ["CLAUDE.md"]},
+        )
 
     def test_directories_and_globs(self):
         retire_dir = item("skills-09", "Retire", ".claude/skills/old")
@@ -656,6 +660,27 @@ class ItemStatusTest(unittest.TestCase):
         changed = {".claude/skills/old/SKILL.md", ".claude/skills/pack-a/SKILL.md"}
         status = st.item_status([retire_dir, glob], changed, {})
         self.assertEqual({v["status"] for v in status.values()}, {"applied"})
+
+    def test_every_path_must_change(self):
+        merge = item(
+            "rules-01", "Merge", ".claude/rules/style.md", targets=[".claude/rules/style.md", "CLAUDE.md"]
+        )
+        status = st.item_status([merge], {"CLAUDE.md"}, {})["rules-01"]
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(status["partial"], ["CLAUDE.md"])
+        self.assertIn(".claude/rules/style.md", status["note"])
+        both = st.item_status([merge], {"CLAUDE.md", ".claude/rules/style.md"}, {})["rules-01"]
+        self.assertEqual(both["status"], "pending")  # it edits .claude/: needs the run's own record
+        claimed = st.item_status(
+            [merge], {"CLAUDE.md", ".claude/rules/style.md"}, {"rules-01": {"outcome": "applied"}}
+        )
+        self.assertEqual(claimed["rules-01"]["status"], "applied")
+
+    def test_hand_item_without_a_record_is_not_applied(self):
+        improve = item("skills-02", "Improve", ".claude/skills/deploy/SKILL.md")
+        status = st.item_status([improve], {".claude/skills/deploy/SKILL.md"}, {})["skills-02"]
+        self.assertEqual(status["status"], "pending")
+        self.assertIn("cannot edit", status["note"])
 
     def test_load_outcomes_tolerates_shapes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -689,7 +714,9 @@ class SmokePublishTest(Base):
 
     def git(self, log, changed):
         def run(*args):
-            return {"for-each-ref": "stocktake/2026-11-01", "log": log, "diff": changed}.get(args[0], "")
+            if args[0] == "log":
+                return changed if "--name-only" in args else log
+            return {"for-each-ref": "stocktake/2026-11-01"}.get(args[0], "")
 
         return run
 
@@ -748,6 +775,66 @@ class SmokePublishTest(Base):
         self.assertIn("Edit denied on settings.json", body)
         self.assertIn('"matcher": "Bash"', body)
         self.assertIn("````diff", body)  # fence longer than the backticks inside
+
+    def test_changed_files_use_the_commit_range_and_skip_notes(self):
+        calls = []
+
+        def git(*args):
+            calls.append(args)
+            if args[0] == "log" and "--name-only" in args:
+                return "CLAUDE.md\n.notes/stocktake/2026-11-01/outcomes.json\n"
+            return ""
+
+        self.assertEqual(st.changed_files(git, "main", "stocktake/x"), {"CLAUDE.md"})
+        self.assertIn("origin/main..stocktake/x", calls[0])
+
+    def test_changed_files_failure_warns(self):
+        def git(*args):
+            raise subprocess.CalledProcessError(128, "git")
+
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            self.assertEqual(st.changed_files(git, "main", "x"), set())
+        self.assertIn("::warning::", out.getvalue())
+
+    def test_pr_body_fits_githubs_limit(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        big = "\n".join(f"-line {n} " + "x" * 80 for n in range(400))  # ~36k
+        outcomes = {i: {"outcome": "pending", "diff": big} for i in ("hooks-02", "hooks-03", "docs-01")}
+        (run / st.OUTCOMES_FILE).write_text(json.dumps(outcomes))
+        execution = self.root / "exec.json"
+        execution.write_text(json.dumps([{"type": "result", "result": "r" * 60_000}]))
+        args = st.build_parser().parse_args(
+            [
+                "apply-publish",
+                "--workspace",
+                str(self.root),
+                "--run-date",
+                "2026-11-01",
+                "--default-branch",
+                "main",
+                "--run-url",
+                RUN_URL,
+                "--issue-number",
+                "1",
+                "--execution-file",
+                str(execution),
+            ]
+        )
+        self.assertEqual(st.cmd_apply_publish(args, self.gh, self.git("abc x", "CLAUDE.md")), 0)
+        body = self.gh.prs[0]["body"]
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        self.assertIn("### Pending items", body)
+
+    def test_unticked_item_drops_its_result(self):
+        self.publish()
+        body = self.gh.issues[1]["body"].replace("- [x] `docs-01`", "- [ ] `docs-01`")
+        data = st.decode_data(body)
+        marks, _ = st.read_marks(body)
+        rerendered = st.render_body(data, marks)
+        rows = {ln.split("`")[1]: ln for ln in rerendered.splitlines() if st.CHECKBOX.match(ln)}
+        self.assertNotIn(st.TAG_APPLIED, rows["docs-01"])
+        self.assertIn(st.TAG_APPLIED, rows["hooks-02"])
 
     def test_no_commit_marks_every_ticked_item_pending(self):
         self.assertEqual(self.publish(log="", changed=""), 0)

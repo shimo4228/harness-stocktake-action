@@ -100,8 +100,9 @@ PROTECTED_FILES = {
     ".mcp.json",
     ".claude.json",
 }
-# Config files whose items edit entries in them, so even a Retire is an edit.
-CONFIG_FILES = {".claude/settings.json", ".claude/settings.local.json"}
+# Config files whose items edit entries in them (a hook, a permission, an MCP server), so even a
+# Retire is an edit. Matched at any depth: a monorepo package can carry its own .claude/.
+CONFIG_SUFFIXES = (".claude/settings.json", ".claude/settings.local.json", ".mcp.json", ".claude.json")
 
 CHECKBOX = re.compile(r"^- \[(?P<mark>[ xX])\] `(?P<id>[^`]+)`")
 APPLY_LINE = re.compile(r"^- \[(?P<mark>[ xX])\] \*\*" + re.escape(APPLY_LABEL) + r"\*\*")
@@ -300,50 +301,75 @@ def is_protected(path: str) -> bool:
     return parts[-1] in PROTECTED_FILES or parts[-1] in PROTECTED_DIRS
 
 
+def _is_config(path: str) -> bool:
+    return any(path == c or path.endswith("/" + c) for c in CONFIG_SUFFIXES)
+
+
 def needs_hand(item: Item) -> bool:
     """An item the Action cannot apply: it edits a protected path.
 
     A Retire of a protected file is a `git rm`, which Claude Code allows, unless the file is a
-    config whose entries the item edits (`.claude/settings.json`).
+    config whose entries the item edits (`.claude/settings.json`, `.mcp.json`).
     """
     paths = item_paths(item)
-    if any(p in CONFIG_FILES or p.split("/")[-1] in PROTECTED_FILES for p in paths):
+    if any(_is_config(p) for p in paths):
         return True
     return verdict_group(str(item.get("verdict", ""))) != "Retire" and any(map(is_protected, paths))
 
 
-def touches(item: Item, changed: set[str]) -> list[str]:
-    """The changed files that belong to an item: its paths, files under them, or glob matches."""
-    hits = set()
-    for t in item_paths(item):
-        if any(c in t for c in "*?["):
-            hits.update(c for c in changed if fnmatch.fnmatchcase(c, t))
-        else:
-            prefix = t.rstrip("/") + "/"
-            hits.update(c for c in changed if c == t or c.startswith(prefix))
-    return sorted(hits)
+def _matches(path: str, changed: set[str]) -> set[str]:
+    """The changed files under one item path: the path itself, files below it, or glob matches."""
+    if any(c in path for c in "*?["):
+        return {c for c in changed if fnmatch.fnmatchcase(c, path)}
+    prefix = path.rstrip("/") + "/"
+    return {c for c in changed if c == path or c.startswith(prefix)}
+
+
+def touches(item: Item, changed: set[str]) -> set[str]:
+    """The changed files that belong to an item."""
+    return set().union(*(_matches(t, changed) for t in item_paths(item)))
 
 
 def item_status(approved: list[Item], changed: set[str], outcomes: dict[str, Item]) -> dict[str, Item]:
     """applied / pending per approved item, from what the branch changed.
 
-    The branch decides: an item whose files the branch leaves alone is pending, whatever the
-    apply run says. outcomes.json, the apply run's own record, can only move an item to pending
-    and add its note and diff.
+    The branch decides. An item is applied only when the branch changes every one of its paths;
+    an item that edits a path Claude Code cannot edit here also needs the apply run to record it
+    as applied, since its protected part can be missing while the rest landed. outcomes.json, the
+    apply run's own record, can move an item to pending and add its note and diff, but it cannot
+    make an unchanged file applied.
     """
     hits = {str(i["id"]): touches(i, changed) for i in approved}
+    owners: dict[str, list[str]] = {}
+    for id_, files in hits.items():
+        for f in files:
+            owners.setdefault(f, []).append(id_)
     status: dict[str, Item] = {}
     for i in approved:
         id_ = str(i["id"])
         record = outcomes.get(id_) or {}
         claimed = str(record.get("outcome", "")).strip().lower()
-        applied = bool(hits[id_]) and claimed not in ("pending", "skipped")
+        missing = [t for t in item_paths(i) if not _matches(t, changed)]
+        applied = (
+            bool(hits[id_])
+            and not missing
+            and claimed not in ("pending", "skipped")
+            and (claimed in ("applied", "reevaluated") or not needs_hand(i))
+        )
         entry: Item = {"status": "applied" if applied else "pending"}
         for key in ("note", "diff"):
             if record.get(key):
                 entry[key] = str(record[key])[:20_000]
+        if not applied and hits[id_]:
+            entry["partial"] = sorted(hits[id_])
+            if "note" not in entry:
+                left = ", ".join(missing) if missing else "a path Claude Code cannot edit in the Action"
+                entry["note"] = (
+                    f"Only part of it is on this branch ({', '.join(sorted(hits[id_]))}); still to do: "
+                    f"{left}. Finish it by hand."
+                )
         if applied and not record:
-            shared = sorted(o for o, h in hits.items() if o != id_ and set(h) & set(hits[id_]))
+            shared = sorted({o for f in hits[id_] for o in owners[f]} - {id_})
             if shared:
                 entry["shared"] = shared
         status[id_] = entry
@@ -444,9 +470,12 @@ TAG_PENDING = "✋ **pending, apply by hand**"
 TAG_HAND = "✋ *by hand*"
 
 
-def _status_tag(item: Item, outcomes: dict[str, Item]) -> str:
-    """Where an item stands: after an apply its result, before one whether it needs a hand edit."""
-    status = (outcomes.get(str(item["id"])) or {}).get("status")
+def _status_tag(item: Item, outcomes: dict[str, Item], ticked: bool) -> str:
+    """Where an item stands: after an apply its result, before one whether it needs a hand edit.
+
+    The result shows only while the box stays ticked: unticking an item drops it from the next apply.
+    """
+    status = (outcomes.get(str(item["id"])) or {}).get("status") if ticked else None
     if status == "applied":
         return f" · {TAG_APPLIED}"
     if status == "pending":
@@ -518,7 +547,8 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
             "",
         ]
         outcomes = data.get("outcomes") or {}
-        if outcomes:
+        shown = {k for k in outcomes if ticked.get(k)}
+        if shown:
             lines += [
                 (
                     f"After the last apply: {TAG_APPLIED} means the item's files changed on "
@@ -527,7 +557,7 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
                 ),
                 "",
             ]
-        if any(needs_hand(i) and str(i["id"]) not in outcomes for i in acting):
+        if any(needs_hand(i) and str(i["id"]) not in shown for i in acting):
             lines += [
                 (
                     f"{TAG_HAND}: Claude Code cannot edit this path inside the Action "
@@ -547,7 +577,7 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
                 mark = "x" if ticked.get(str(i["id"])) else " "
                 n = len(i.get("targets") or [])
                 extra = f" (+{n - 1} more)" if n > 1 else ""
-                tag = _status_tag(i, outcomes)
+                tag = _status_tag(i, outcomes, bool(ticked.get(str(i["id"]))))
                 line = f"- [{mark}] {_label(i)}{extra}{tag} — {_inline(_first_sentence(i.get('reason')))}"
                 if budget - len(line) - 1 < 0:
                     hidden += 1
@@ -813,12 +843,18 @@ def apply_branch(git: Git, base: str, run_date: str) -> tuple[str, str]:
 
 
 def changed_files(git: Git, base: str, ref: str) -> set[str]:
-    """Paths the branch adds, changes or deletes against the default branch (renames as both)."""
+    """Paths the branch's commits add, change or delete (renames as both old and new path).
+
+    The same range as the commit list, so it needs no merge base. The run's own notes under
+    .notes/ are not part of any item.
+    """
     try:
-        out = git("diff", "--name-only", "--no-renames", f"origin/{base}...{ref}")
-    except subprocess.CalledProcessError:
+        out = git("log", "--name-only", "--no-renames", "--format=", f"origin/{base}..{ref}")
+    except subprocess.CalledProcessError as err:
+        print(f"::warning::Could not list the branch's files ({err}); every item reads as pending.")
         return set()
-    return {line.strip() for line in out.splitlines() if line.strip()}
+    root = f"{REPORT_ROOT.parts[0]}/"
+    return {ln.strip() for ln in out.splitlines() if ln.strip() and not ln.strip().startswith(root)}
 
 
 def _fence(text: str, lang: str = "") -> list[str]:
@@ -837,6 +873,8 @@ def pr_body(
     branch: str,
     log: str,
     report: str,
+    diff_limit: int = 20_000,
+    report_limit: int = 40_000,
 ) -> str:
     applied = [i for i in approved if status[str(i["id"])]["status"] == "applied"]
     pending = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
@@ -885,8 +923,21 @@ def pr_body(
             lines += [f"#### {_label(i)}", ""]
             if entry.get("note"):
                 lines += [_neutralise(entry["note"]), ""]
-            if entry.get("diff"):
+            if entry.get("partial"):
+                lines += [
+                    f"Partly on this branch: {', '.join(f'`{_inline(f, 120)}`' for f in entry['partial'])}.",
+                    "",
+                ]
+            if entry.get("diff") and len(entry["diff"]) <= diff_limit:
                 lines += [*_fence(_neutralise(entry["diff"]), "diff"), ""]
+            elif entry.get("diff"):
+                lines += [
+                    (
+                        f"The diff ({len(entry['diff'])} characters) is too long for this pull request; "
+                        "see the completion report."
+                    ),
+                    "",
+                ]
             else:
                 lines += [
                     (
@@ -894,18 +945,21 @@ def pr_body(
                         "completion report may say more."
                     ),
                     "",
-                    *_fence(_neutralise(i.get("change") or "(none)")),
+                    *_fence(_neutralise(str(i.get("change") or "(none)")[:diff_limit])),
                     "",
                 ]
     if log:
         lines += ["", "### Commits", "", *_fence(log), ""]
     if report:
+        cut = report[:report_limit]
+        if len(report) > report_limit:
+            cut += "\n\n… (cut; the full report is in the run's summary)"
         lines += [
             "### Completion report",
             "",
             "<details><summary>From the apply run</summary>",
             "",
-            _neutralise(report[:40_000]),
+            _neutralise(cut),
             "",
             "</details>",
             "",
@@ -936,16 +990,25 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
 
     git("push", "--force", "origin", f"refs/heads/{local}:refs/heads/{args.branch}")
 
-    body = pr_body(
-        data,
-        approved,
-        status,
-        issue["number"],
-        args.run_url,
-        args.branch,
-        log,
-        final_message(args.execution_file),
-    )
+    report = final_message(args.execution_file)
+    # GitHub caps a PR body like an issue body: shorten the diffs, then the report, until it fits.
+    for diff_limit, report_limit in ((20_000, 40_000), (8_000, 15_000), (3_000, 5_000), (0, 0)):
+        body = pr_body(
+            data,
+            approved,
+            status,
+            issue["number"],
+            args.run_url,
+            args.branch,
+            log,
+            report,
+            diff_limit,
+            report_limit,
+        )
+        if len(body) <= MAX_BODY:
+            break
+    else:
+        body = body[: MAX_BODY - 40] + "\n\n… (cut to fit GitHub's limit)\n"
     title = f"Harness stocktake {data.get('report_date')}"
 
     pr = gh.find_pr(args.branch)
