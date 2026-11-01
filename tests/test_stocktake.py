@@ -949,6 +949,52 @@ class SmokePublishTest(Base):
         self.assertIn("### Completion report", body)
         self.assertEqual(open_blocks(body), (False, 0))
 
+    def test_final_cut_drops_links_to_cut_pending_items(self):
+        many = [item(f"docs-{n:03d}", "Update", f"docs/f{n}.md", source="docs", order=n) for n in range(150)]
+        for i in many:
+            i["change"] = "c" * 5_000
+        data = {"report_date": "2026-11-01", "items": many}
+        self.gh.issues[1]["body"] = st.render_body(data, {i["id"]: True for i in many})
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        (run / st.OUTCOMES_FILE).write_text(json.dumps({i["id"]: {"note": "n" * 20_000} for i in many}))
+        self.publish(changed="")
+        body = self.gh.prs[0]["body"]
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        self.assertIn("cut to fit GitHub's limit", body)
+        lines = {ln.split("`")[1]: ln for ln in body.splitlines() if ln.startswith("- `docs-")}
+        self.assertEqual(len(lines), 150)
+        cut = [i for i in many if f"#### {st._label(i)}" not in body]
+        self.assertTrue(cut)
+        for i in many:
+            linked = "#pending-items" in lines[i["id"]]
+            self.assertEqual(linked, i not in cut, i["id"])
+        self.assertEqual(open_blocks(body), (False, 0))
+
+    def test_short_change_is_shown_at_the_last_tier(self):
+        pending = [SMOKE_ITEMS[1], dict(SMOKE_ITEMS[2], change="")]
+        status = {i["id"]: {"status": "pending"} for i in pending}
+        body = st.pr_body({"report_date": "2026-11-01"}, pending, status, 1, RUN_URL, "b", "", "", 0, 0, 300)
+        self.assertIn("```\nchange hooks-03\n```", body)
+        self.assertIn("```\n(none)\n```", body)
+        self.assertNotIn("too long", body)
+        long = [dict(SMOKE_ITEMS[1], change="x" * 2_000)]
+        body = st.pr_body({"report_date": "2026-11-01"}, long, status, 1, RUN_URL, "b", "", "", 0, 0, 300)
+        self.assertIn("approved change (2000 characters) is too long", body)
+
+    def test_a_diff_too_long_to_show_is_never_shown_cut(self):
+        run = self.root / st.REPORT_ROOT / "2026-11-01"
+        run.mkdir(parents=True)
+        diff = "\n".join(f"-line {n} " + "x" * 90 for n in range(300))  # ~30k
+        self.assertGreater(len(diff), 20_000)
+        (run / st.OUTCOMES_FILE).write_text(json.dumps({"hooks-03": {"outcome": "pending", "diff": diff}}))
+        self.publish()
+        body = self.gh.prs[0]["body"]
+        self.assertIn(f"The diff ({len(diff)} characters) is too long", body)
+        self.assertNotIn("-line 0 ", body)
+        status = st.item_status([SMOKE_ITEMS[1]], set(), {"hooks-03": {"outcome": "pending", "diff": diff}})
+        self.assertEqual(status["hooks-03"]["diff"], diff)
+
     def test_close_blocks_after_a_cut(self):
         text = "<details><summary>s</summary>\n\n````diff\n+a\n```\n+b"
         closed = st._close_blocks(text)

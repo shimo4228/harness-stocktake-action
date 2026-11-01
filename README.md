@@ -125,7 +125,7 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 | `plugin_ref` | `v0.1.0` | The harness-stocktake tag, branch, or commit to run. |
 | `plugin_repository` | `shimo4228/harness-stocktake` | Where the plugin marketplace lives. |
 | `plugin_token` | `github.token` | Read access to `plugin_repository`. Only needed while that repository is private. |
-| `claude_args` | allowed tools for the plugin | Passed through to the Claude Code CLI. No allow rule here lets it edit `.claude/` (see [What it can't change](#what-it-cant-change)). See [Allowed tools](#allowed-tools) for the default. |
+| `claude_args` | allowed tools for the plugin | Passed through to the Claude Code CLI. See [Allowed tools](#allowed-tools) for the default. The list is not a sandbox. Claude Code's protected-path check, which no allow rule lifts, keeps its Edit and Write tools out of `.claude/` (see [What it can't change](#what-it-cant-change)). |
 
 Outputs: `mode`, `issue_number`, `pr_url`.
 
@@ -135,9 +135,9 @@ The default `claude_args` passes `--allowedTools` with what the plugin uses:
 
 - Claude Code's file tools: `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep`, plus `Agent`, `Task`, `Skill` and `TodoWrite`.
 - `git`, `python3` and `uv`, which the plugin's scripts run with.
-- Shell commands the audit reads the harness with: `cat`, `head`, `tail`, `grep`, `find`, `ls`, `wc`, `sort`, `cd`, `date` and `command -v`, plus `mkdir` for its notes. Without them the audit stops on permission denials and writes no report.
+- Shell commands the audit reads the harness with: `cat`, `head`, `tail`, `grep`, `ls`, `wc`, `cd`, `date` and `command -v`, plus `mkdir` for its notes. Without them the audit stops on permission denials and writes no report. `find` and `sort` are left out: `find -exec` starts any command and `find -delete` and `sort -o` write files. The `Glob` tool finds files instead.
 
-It allows no command whose job is to reach the network or start another shell (`curl`, `wget`, `gh`, `nc`, `ssh`, `bash`, `sh`, `env`, `eval`). `command` is allowed only as `command -v`, because `command <name>` runs any command. The list is not a sandbox: `git`, `python3` and `uv` can run code, and Claude Code's own checks decide what a compound command may do. If you set `claude_args` yourself, start from this list.
+It allows no command whose job is to reach the network or start another shell (`curl`, `wget`, `gh`, `nc`, `ssh`, `bash`, `sh`, `env`, `eval`). `command` is allowed only as `command -v`, because `command <name>` runs any command. The list is not a sandbox: `git`, `python3` and `uv` can run code and write files. What keeps Claude Code's Edit and Write tools out of `.claude/` and the other protected paths is its protected-path check (see [What it can't change](#what-it-cant-change)), not this list; a `git`, `python3` or `uv` command is not covered by that check. If you set `claude_args` yourself, start from this list.
 
 Needs a Linux or macOS runner, with `git` and Python 3.10 or later. GitHub-hosted runners have both.
 
@@ -146,7 +146,7 @@ Needs a Linux or macOS runner, with `git` and Python 3.10 or later. GitHub-hoste
 - `plugin_marketplaces` in claude-code-action v1 accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
 - Ticking an issue box needs a trigger, so the workflow also listens to `issues: edited`. The job runs only when the tracked issue's **Apply** box is ticked.
 - Pull request runs report to the run summary only and leave the tracked issue alone (see above).
-- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary. Diffs are shown as written, in a code block.
+- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary. A diff that fits is shown whole and as written, in a code block; one that doesn't is replaced by a note with its length, never shown cut.
 
 ## Development
 

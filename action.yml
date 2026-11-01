@@ -35,10 +35,10 @@ inputs:
     required: false
     default: ${{ github.token }}
   claude_args:
-    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use, including the read-only shell commands the audit reads files with. No allow rule lets Claude Code edit .claude/ (see README, What it can't change)."
+    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use, including the shell commands the audit reads files with. The list is not a sandbox (git, python3 and uv run code); Claude Code's protected-path check, which no allow rule lifts, keeps its Edit and Write tools out of .claude/ (see README, What it can't change)."
     required: false
     default: >-
-      --allowedTools "Read,Write,Edit,MultiEdit,Glob,Grep,Agent,Task,Skill,TodoWrite,Bash(git:*),Bash(python3:*),Bash(uv:*),Bash(date:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(find:*),Bash(cd:*),Bash(sort:*),Bash(command -v:*)"
+      --allowedTools "Read,Write,Edit,MultiEdit,Glob,Grep,Agent,Task,Skill,TodoWrite,Bash(git:*),Bash(python3:*),Bash(uv:*),Bash(date:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(cd:*),Bash(command -v:*)"
 
 outputs:
   mode:
