@@ -38,6 +38,10 @@ DATA_CLOSE = "-->"
 APPLY_LABEL = "Apply the ticked items"
 APPLY_MARKER = "<!-- apply -->"
 MAX_BODY = 65000  # GitHub caps an issue body at 65536 characters
+MAX_VISIBLE = 40000  # the checklist's share; the rest is left for the data blob
+PR_BRANCH = "claude/stocktake"
+REPORT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+WRITE_PERMISSIONS = {"admin", "maintain", "write"}
 REPORT_ROOT = Path(".notes/stocktake")
 
 GROUPS = ["Retire", "Merge / demote", "Improve / update", "Other", "Keep"]
@@ -92,11 +96,15 @@ class GitHub:
         return json.loads(raw) if raw else None
 
     def find_issue(self) -> dict[str, Any] | None:
+        """The oldest open issue the Action itself opened; issues people open are never touched."""
         page = 1
         while True:
-            batch = self.request("GET", f"/repos/{self.repo}/issues?state=open&per_page=100&page={page}")
+            batch = self.request(
+                "GET",
+                f"/repos/{self.repo}/issues?state=open&sort=created&direction=asc&per_page=100&page={page}",
+            )
             for issue in batch:
-                if "pull_request" not in issue and issue.get("title") == ISSUE_TITLE:
+                if "pull_request" not in issue and is_tracked_issue(issue):
                     return issue
             if len(batch) < 100:
                 return None
@@ -104,6 +112,9 @@ class GitHub:
 
     def get_issue(self, number: int) -> dict[str, Any]:
         return self.request("GET", f"/repos/{self.repo}/issues/{number}")
+
+    def permission(self, login: str) -> str:
+        return self.request("GET", f"/repos/{self.repo}/collaborators/{login}/permission")["permission"]
 
     def create_issue(self, body: str) -> dict[str, Any]:
         return self.request("POST", f"/repos/{self.repo}/issues", {"title": ISSUE_TITLE, "body": body})
@@ -130,6 +141,15 @@ class GitHub:
         return self.request("PATCH", f"/repos/{self.repo}/pulls/{number}", {"title": title, "body": body})
 
 
+def is_tracked_issue(issue: dict[str, Any]) -> bool:
+    """The tracked issue: our title, opened by a bot (the workflow token), carrying our marker."""
+    return (
+        issue.get("title") == ISSUE_TITLE
+        and (issue.get("user") or {}).get("type") == "Bot"
+        and BODY_MARKER in (issue.get("body") or "")
+    )
+
+
 # --- report data ------------------------------------------------------------------------------
 
 
@@ -141,8 +161,31 @@ def verdict_group(verdict: str) -> str:
     return "Other"
 
 
+def _tracked_by_git(path: Path) -> bool:
+    """True when git tracks the file: a report committed to the repo, not one this run wrote."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path.parent), "ls-files", "--", path.name],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return bool(out.strip())
+
+
+def _fresh_run(run: Path) -> bool:
+    items = run / "items-all.json"
+    return items.is_file() and not _tracked_by_git(items)
+
+
 def find_run_dir(workspace: Path) -> Path | None:
-    """The run directory of the newest report: latest.json first, else the newest dated dir."""
+    """The run directory this job's audit wrote: latest.json first, else the newest dated dir.
+
+    A report committed to the repo is never taken, so a failed audit cannot pass an old report
+    off as this run's.
+    """
     root = workspace / REPORT_ROOT
     latest = root / "latest.json"
     if latest.is_file():
@@ -152,11 +195,11 @@ def find_run_dir(workspace: Path) -> Path | None:
             report = None
         if report is not None:
             run = report.parent if report.is_absolute() else (workspace / report).parent
-            if (run / "items-all.json").is_file():
+            if _fresh_run(run):
                 return run
     if not root.is_dir():
         return None
-    runs = sorted(p for p in root.iterdir() if p.is_dir() and (p / "items-all.json").is_file())
+    runs = sorted(p for p in root.iterdir() if p.is_dir() and _fresh_run(p))
     return runs[-1] if runs else None
 
 
@@ -226,12 +269,16 @@ def read_marks(body: str) -> tuple[dict[str, bool], bool]:
 # --- issue body -------------------------------------------------------------------------------
 
 
+def _neutralise(text: object) -> str:
+    """Repo-derived text that cannot ping a user or team, or open or close an HTML comment."""
+    s = str(text or "").replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    return re.sub(r"@(?=\w)", "@\u200b", s)
+
+
 def _inline(text: object, limit: int = 240) -> str:
     """Repo-derived text on one line, unable to tick a box, ping a user or close a comment."""
-    s = " ".join(str(text or "").split())
-    s = s.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+    s = _neutralise(" ".join(str(text or "").split()))
     s = s.replace("[", "\\[").replace("`", "'")
-    s = re.sub(r"@(?=\w)", "@\u200b", s)
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
@@ -296,17 +343,33 @@ def render_body(data: dict[str, Any], ticked: dict[str, bool]) -> str:
             ),
             "",
         ]
+        budget = MAX_VISIBLE - sum(len(ln) + 1 for ln in lines)
+        hidden = 0
         for group in GROUPS[:-1]:
             rows = [i for i in acting if verdict_group(str(i["verdict"])) == group]
             if not rows:
                 continue
-            lines += [f"### {group}", ""]
+            block = [f"### {group}", ""]
             for i in rows:
                 mark = "x" if ticked.get(str(i["id"])) else " "
                 n = len(i.get("targets") or [])
                 extra = f" (+{n - 1} more)" if n > 1 else ""
-                lines.append(f"- [{mark}] {_label(i)}{extra} — {_inline(_first_sentence(i.get('reason')))}")
-            lines.append("")
+                line = f"- [{mark}] {_label(i)}{extra} — {_inline(_first_sentence(i.get('reason')))}"
+                if budget - len(line) - 1 < 0:
+                    hidden += 1
+                    continue
+                budget -= len(line) + 1
+                block.append(line)
+            if len(block) > 2:
+                lines += [*block, ""]
+        if hidden:
+            lines += [
+                (
+                    f"**{hidden} more item(s) do not fit in this issue.** They are in the run's summary; "
+                    "apply the ones above first and the rest return in the next report."
+                ),
+                "",
+            ]
         lines += ["---", "", f"- [ ] **{APPLY_LABEL}** {APPLY_MARKER}", ""]
     if keep:
         lines += ["<details><summary>Kept items</summary>", ""]
@@ -329,7 +392,10 @@ def _with_data(lines: list[str], data: dict[str, Any]) -> str:
         body = f"{visible}\n\n{DATA_OPEN}\n{encode_data(candidate)}\n{DATA_CLOSE}\n"
         if len(body) <= MAX_BODY:
             return body
-    raise ValueError("report too large for the tracked issue")
+    # Even the trimmed data does not fit: keep the issue updated, without apply data.
+    note = "**Note:** the report is too large to store in this issue, so it cannot be applied from here."
+    bare = {k: v for k, v in data.items() if k not in ("items", "crosscheck", "report_date")}
+    return f"{visible}\n\n{note}\n\n{DATA_OPEN}\n{encode_data(bare)}\n{DATA_CLOSE}\n"
 
 
 def stamp(run_url: str, result: str, now: dt.datetime | None = None) -> dict[str, str]:
@@ -388,8 +454,9 @@ def cmd_audit_sync(args: argparse.Namespace, gh: GitHub) -> int:
     ticked = {str(i["id"]): carried.get(item_key(i), False) for i in acting}
 
     data["last_run"] = stamp(args.run_url, f"report {data['report_date']}, {len(acting)} item(s) to change")
-    if previous and previous.get("pr_url"):
-        data["pr_url"] = previous["pr_url"]
+    pr = gh.find_pr(PR_BRANCH)
+    if pr:
+        data["pr_url"] = pr["html_url"]
     body = render_body(data, ticked)
     issue = gh.update_issue(issue["number"], body) if issue else gh.create_issue(body)
     print(f"Tracked issue: {issue.get('html_url', issue['number'])}")
@@ -397,8 +464,13 @@ def cmd_audit_sync(args: argparse.Namespace, gh: GitHub) -> int:
     return 0
 
 
-def record_failure(gh: GitHub, run_url: str, message: str) -> None:
-    issue = gh.find_issue()
+def tracked_issue(gh: GitHub, number: int | None) -> dict[str, Any] | None:
+    """The tracked issue: by number when the run already knows it, else by search."""
+    return gh.get_issue(number) if number else gh.find_issue()
+
+
+def record_failure(gh: GitHub, run_url: str, message: str, number: int | None = None) -> None:
+    issue = tracked_issue(gh, number)
     data = (decode_data(issue["body"] or "") if issue else None) or {}
     marks = read_marks(issue["body"] or "")[0] if issue else {}
     data["last_run"] = stamp(run_url, message)
@@ -410,7 +482,7 @@ def record_failure(gh: GitHub, run_url: str, message: str) -> None:
 
 
 def cmd_mark_failed(args: argparse.Namespace, gh: GitHub) -> int:
-    record_failure(gh, args.run_url, args.message)
+    record_failure(gh, args.run_url, args.message, args.issue_number)
     return 0
 
 
@@ -445,8 +517,13 @@ def report_markdown(data: dict[str, Any], ticked: dict[str, bool]) -> str:
 def cmd_apply_prepare(args: argparse.Namespace, gh: GitHub) -> int:
     event = json.loads(Path(args.event_path).read_text())
     issue = event.get("issue") or {}
-    if issue.get("title") != ISSUE_TITLE:
-        print("Not the tracked issue.")
+    if not is_tracked_issue(issue):
+        print("Not the tracked issue (it must be the one this Action opened).")
+        write_output(apply="false")
+        return 0
+    sender = (event.get("sender") or {}).get("login", "")
+    if not sender or gh.permission(sender) not in WRITE_PERMISSIONS:
+        print(f"::warning::{sender or 'An unknown user'} has no write access; edit ignored.")
         write_output(apply="false")
         return 0
     body = issue.get("body") or ""
@@ -456,7 +533,7 @@ def cmd_apply_prepare(args: argparse.Namespace, gh: GitHub) -> int:
         write_output(apply="false")
         return 0
     data = decode_data(body)
-    if not data or not data.get("report_date"):
+    if not data or not REPORT_DATE.match(str(data.get("report_date", ""))):
         print("::error::The tracked issue holds no report data; run the workflow once first.")
         write_output(apply="false")
         return 1
@@ -514,21 +591,40 @@ def final_message(execution_file: str | None) -> str:
     return ""
 
 
+def apply_branch(git: Git, base: str, run_date: str) -> tuple[str, str]:
+    """The branch the apply run committed to, and its commits over the default branch.
+
+    The plugin names it stocktake/<date>, and that date may be the day of the apply rather than
+    the report's, so every local stocktake/* branch is a candidate: the report's date first, then
+    the newest commit.
+    """
+    try:
+        refs = git(
+            "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads/stocktake/"
+        ).split()
+    except subprocess.CalledProcessError:
+        refs = []
+    preferred = f"stocktake/{run_date}"
+    refs.sort(key=lambda r: r != preferred)  # stable: keeps newest-first among the rest
+    for ref in refs:
+        try:
+            log = git("log", "--oneline", f"origin/{base}..{ref}")
+        except subprocess.CalledProcessError:
+            continue
+        if log:
+            return ref, log
+    return "", ""
+
+
 def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) -> int:
-    issue = gh.find_issue()
+    issue = tracked_issue(gh, args.issue_number)
     if issue is None:
         print("::error::The tracked issue is gone.")
         return 1
     data = decode_data(issue["body"] or "") or {}
     marks, _ = read_marks(issue["body"] or "")
-    local = f"stocktake/{args.run_date}"
     base = args.default_branch or gh.default_branch()
-
-    try:
-        git("rev-parse", "--verify", f"refs/heads/{local}")
-        log = git("log", "--oneline", f"origin/{base}..{local}")
-    except subprocess.CalledProcessError:
-        log = ""
+    local, log = apply_branch(git, base, args.run_date)
     if not log:
         data["last_run"] = stamp(args.run_url, "apply made no commit")
         data["note"] = "The apply run made no commit; see the run log for the pending items."
@@ -561,7 +657,7 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
             "",
             "<details><summary>From the apply run</summary>",
             "",
-            report[:40_000],
+            _neutralise(report[:40_000]),
             "",
             "</details>",
             "",
@@ -601,13 +697,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("apply-publish")
     c.add_argument("--run-date", required=True)
-    c.add_argument("--branch", default="claude/stocktake")
+    c.add_argument("--branch", default=PR_BRANCH)
     c.add_argument("--default-branch", default="")
     c.add_argument("--execution-file", default="")
 
     d = sub.add_parser("mark-failed")
     d.add_argument("--message", required=True)
 
+    for s in (c, d):
+        s.add_argument("--issue-number", type=int, default=None)
     for s in (a, b, c, d):
         s.add_argument("--run-url", default=default_run_url())
     return p

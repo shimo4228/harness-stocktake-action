@@ -44,7 +44,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: harness-stocktake
+  # Pull request runs queue apart, so they never cancel a pending apply or monthly run.
+  group: harness-stocktake-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'repo' }}
   cancel-in-progress: false
 
 jobs:
@@ -52,6 +53,7 @@ jobs:
     if: >-
       (github.event_name != 'issues' ||
         (github.event.issue.title == 'Harness stocktake' &&
+         github.event.issue.user.type == 'Bot' &&
          contains(github.event.issue.body, '- [x] **Apply the ticked items**'))) &&
       (github.event_name != 'pull_request' ||
         (github.event.pull_request.head.repo.full_name == github.repository &&

@@ -42,15 +42,24 @@ ITEMS = [
 
 
 class FakeGitHub:
-    def __init__(self, issues=None, prs=None):
+    def __init__(self, issues=None, prs=None, permissions=None):
         self.issues = {i["number"]: dict(i) for i in (issues or [])}
         self.prs = list(prs or [])
+        self.permissions = permissions or {"owner": "admin"}
         self.calls = []
 
     def find_issue(self):
         self.calls.append("find_issue")
-        open_ = [i for i in self.issues.values() if i["title"] == st.ISSUE_TITLE]
+        open_ = [i for i in sorted(self.issues.values(), key=lambda i: i["number"]) if st.is_tracked_issue(i)]
         return dict(open_[0]) if open_ else None
+
+    def get_issue(self, number):
+        self.calls.append(("get_issue", number))
+        return dict(self.issues[number])
+
+    def permission(self, login):
+        self.calls.append(("permission", login))
+        return self.permissions.get(login, "read")
 
     def create_issue(self, body):
         number = max(self.issues, default=0) + 1
@@ -58,6 +67,7 @@ class FakeGitHub:
             "number": number,
             "title": st.ISSUE_TITLE,
             "body": body,
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
             "html_url": f"https://github.com/o/r/issues/{number}",
         }
         self.calls.append(("create_issue", number))
@@ -198,6 +208,22 @@ class DataTest(unittest.TestCase):
         self.assertEqual([i["id"] for i in st.decode_data(body)["items"]], ["skills-01"])
 
 
+class OversizedChecklistTest(unittest.TestCase):
+    def test_caps_the_visible_list_and_says_so(self):
+        many = [
+            item(
+                f"docs-{n:03}", "Update", f"docs/{n}-{os.urandom(40).hex()}.md", reason=os.urandom(150).hex()
+            )
+            for n in range(400)
+        ]
+        body = st.render_body({"report_date": "2026-11-01", "items": many}, {})
+        self.assertLessEqual(len(body), st.MAX_BODY)
+        self.assertIn("do not fit in this issue", body)
+        self.assertIn(st.APPLY_MARKER, body)
+        shown, _ = st.read_marks(body)
+        self.assertTrue(0 < len(shown) < 400)
+
+
 class FindRunDirTest(Base):
     def test_latest_json_wins(self):
         self.write_run(date="2026-12-01", latest=False)
@@ -240,10 +266,7 @@ class AuditSyncTest(Base):
         gh = FakeGitHub()
         self.audit(gh)
         gh.issues[1]["body"] = gh.issues[1]["body"].replace("- [ ] `docs-01`", "- [x] `docs-01`")
-        prev = st.decode_data(gh.issues[1]["body"])
-        prev["pr_url"] = "https://github.com/o/r/pull/50"
-        marks, _ = st.read_marks(gh.issues[1]["body"])
-        gh.issues[1]["body"] = st.render_body(prev, marks)
+        gh.prs.append({"number": 50, "head": st.PR_BRANCH, "html_url": "https://github.com/o/r/pull/50"})
 
         # Next month: ids are renumbered, the docs item is the same finding.
         renumbered = [dict(i, id=i["id"].replace("01", "07")) for i in ITEMS]
@@ -258,6 +281,42 @@ class AuditSyncTest(Base):
         self.assertEqual(marks, {"skills-07": False, "docs-07": True, "hooks-07": False})
         self.assertIn("pull/50", body)
         self.assertIn("2026-12-01", body)
+
+    def test_drops_the_link_once_the_pr_is_closed(self):
+        self.write_run()
+        data = {"report_date": "2026-10-01", "items": ITEMS, "pr_url": "https://github.com/o/r/pull/12"}
+        gh = FakeGitHub(
+            issues=[
+                {
+                    "number": 1,
+                    "title": st.ISSUE_TITLE,
+                    "user": {"type": "Bot", "login": "github-actions[bot]"},
+                    "body": st.render_body(data, {}),
+                }
+            ]
+        )
+        self.audit(gh)
+        self.assertNotIn("pull/12", gh.issues[1]["body"])
+        self.assertNotIn("**Pull request:**", gh.issues[1]["body"])
+
+    def test_leaves_issues_people_opened_alone(self):
+        self.write_run()
+        human = {"number": 1, "title": st.ISSUE_TITLE, "user": {"type": "User"}, "body": "Bug: it broke"}
+        gh = FakeGitHub(issues=[human])
+        self.audit(gh)
+        self.assertEqual(gh.issues[1]["body"], "Bug: it broke")
+        self.assertIn(("create_issue", 2), gh.calls)
+
+    def test_ignores_a_committed_report(self):
+        run = self.write_run(date="2026-10-01")
+        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git[:3], "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", "old report"], check=True)
+        self.assertIsNone(st.find_run_dir(self.root))
+        fresh = self.write_run(date="2026-11-01", latest=False)
+        self.assertEqual(st.find_run_dir(self.root), fresh)
+        self.assertNotEqual(fresh, run)
 
     def test_no_report_marks_the_issue(self):
         gh = FakeGitHub()
@@ -290,10 +349,16 @@ class ApplyPrepareTest(Base):
             body = body.replace(f"- [ ] **{st.APPLY_LABEL}**", f"- [x] **{st.APPLY_LABEL}**")
         return body
 
-    def prepare(self, gh, body, title=st.ISSUE_TITLE):
+    def prepare(self, gh, body, title=st.ISSUE_TITLE, user=None, sender="owner"):
+        issue = {
+            "number": 7,
+            "title": title,
+            "body": body,
+            "user": user or {"type": "Bot", "login": "github-actions[bot]"},
+        }
         event = self.root / "event.json"
-        event.write_text(json.dumps({"issue": {"number": 7, "title": title, "body": body}}))
-        gh.issues[7] = {"number": 7, "title": title, "body": body}
+        event.write_text(json.dumps({"issue": issue, "sender": {"login": sender}}))
+        gh.issues[7] = dict(issue)
         args = st.build_parser().parse_args(
             ["apply-prepare", "--workspace", str(self.root), "--event-path", str(event), "--run-url", RUN_URL]
         )
@@ -309,7 +374,31 @@ class ApplyPrepareTest(Base):
         gh = FakeGitHub()
         self.prepare(gh, self.issue_body(tick=["docs-01"], apply=False))
         self.assertEqual(self.outputs()["apply"], "false")
+        self.assertEqual(gh.calls, [("permission", "owner")])
+
+    def test_issue_opened_by_a_person_is_ignored(self):
+        gh = FakeGitHub()
+        self.prepare(gh, self.issue_body(tick=["docs-01"]), user={"type": "User", "login": "mallory"})
+        self.assertEqual(self.outputs()["apply"], "false")
         self.assertEqual(gh.calls, [])
+        self.assertFalse((self.root / ".notes").exists())
+
+    def test_edit_without_write_access_is_ignored(self):
+        gh = FakeGitHub(permissions={"mallory": "read"})
+        self.prepare(gh, self.issue_body(tick=["docs-01"]), sender="mallory")
+        self.assertEqual(self.outputs()["apply"], "false")
+        self.assertEqual(gh.calls, [("permission", "mallory")])
+        self.assertFalse((self.root / ".notes").exists())
+
+    def test_report_date_cannot_escape_the_notes_dir(self):
+        data = {"report_date": "../../evil", "items": ITEMS}
+        body = st.render_body(data, {"docs-01": True}).replace(
+            f"- [ ] **{st.APPLY_LABEL}**", f"- [x] **{st.APPLY_LABEL}**"
+        )
+        gh = FakeGitHub()
+        self.assertEqual(self.prepare(gh, body), 1)
+        self.assertEqual(self.outputs()["apply"], "false")
+        self.assertFalse((self.root / "evil").exists())
 
     def test_restores_the_run_with_decisions(self):
         gh = FakeGitHub()
@@ -344,7 +433,7 @@ class ApplyPrepareTest(Base):
 
     def test_issue_without_data(self):
         gh = FakeGitHub()
-        body = f"- [x] **{st.APPLY_LABEL}** {st.APPLY_MARKER}"
+        body = f"{st.BODY_MARKER}\n- [x] **{st.APPLY_LABEL}** {st.APPLY_MARKER}"
         self.assertEqual(self.prepare(gh, body), 1)
         self.assertEqual(self.outputs()["apply"], "false")
 
@@ -354,7 +443,14 @@ class ApplyPublishTest(Base):
         super().setUp()
         data = {"report_date": "2026-11-01", "items": ITEMS}
         self.gh = FakeGitHub(
-            issues=[{"number": 7, "title": st.ISSUE_TITLE, "body": st.render_body(data, {"docs-01": True})}]
+            issues=[
+                {
+                    "number": 7,
+                    "title": st.ISSUE_TITLE,
+                    "user": {"type": "Bot", "login": "github-actions[bot]"},
+                    "body": st.render_body(data, {"docs-01": True}),
+                }
+            ]
         )
         self.git_calls = []
         self.execution = self.root / "exec.json"
@@ -364,9 +460,11 @@ class ApplyPublishTest(Base):
             )
         )
 
-    def git(self, log="abc1234 docs: update README"):
+    def git(self, log="abc1234 docs: update README", branches="stocktake/2026-11-01"):
         def run(*args):
             self.git_calls.append(args)
+            if args[0] == "for-each-ref":
+                return branches
             if args[0] == "log":
                 return log
             return ""
@@ -385,6 +483,8 @@ class ApplyPublishTest(Base):
                 str(self.execution),
                 "--run-url",
                 RUN_URL,
+                "--issue-number",
+                "7",
             ]
         )
         return st.cmd_apply_publish(args, self.gh, git)
@@ -426,20 +526,42 @@ class ApplyPublishTest(Base):
         self.assertIn("made no commit", self.gh.issues[7]["body"])
 
     def test_missing_branch(self):
-        def git(*args):
-            if args[0] == "rev-parse":
-                raise subprocess.CalledProcessError(128, "git")
-            return ""
-
-        self.assertEqual(self.publish(git), 0)
+        self.assertEqual(self.publish(self.git(branches="")), 0)
         self.assertEqual(self.gh.prs, [])
+
+    def test_finds_a_branch_named_for_the_apply_day(self):
+        self.assertEqual(self.publish(self.git(branches="stocktake/2026-11-05")), 0)
+        self.assertIn(
+            ("push", "--force", "origin", "refs/heads/stocktake/2026-11-05:refs/heads/claude/stocktake"),
+            self.git_calls,
+        )
+        self.assertEqual(len(self.gh.prs), 1)
+
+    def test_looks_up_the_issue_by_number(self):
+        self.publish(self.git())
+        self.assertIn(("get_issue", 7), self.gh.calls)
+        self.assertNotIn("find_issue", self.gh.calls)
+
+    def test_completion_report_cannot_ping_or_open_comments(self):
+        self.execution.write_text(json.dumps([{"type": "result", "result": "Done. cc @org/team <!-- x"}]))
+        self.publish(self.git())
+        body = self.gh.prs[0]["body"]
+        self.assertNotIn("@org", body)
+        self.assertNotIn("<!-- x", body)
 
 
 class MarkFailedTest(Base):
     def test_keeps_report_and_records_failure(self):
         data = {"report_date": "2026-11-01", "items": ITEMS}
         gh = FakeGitHub(
-            issues=[{"number": 3, "title": st.ISSUE_TITLE, "body": st.render_body(data, {"docs-01": True})}]
+            issues=[
+                {
+                    "number": 3,
+                    "title": st.ISSUE_TITLE,
+                    "user": {"type": "Bot", "login": "github-actions[bot]"},
+                    "body": st.render_body(data, {"docs-01": True}),
+                }
+            ]
         )
         args = st.build_parser().parse_args(
             ["mark-failed", "--message", "apply failed", "--run-url", RUN_URL]
@@ -455,9 +577,11 @@ class GitHubClientTest(unittest.TestCase):
     def test_find_issue_pages_and_skips_prs(self):
         gh = st.GitHub("t", "o/r")
         page1 = [{"number": n, "title": "x"} for n in range(100)]
+        tracked = {"title": st.ISSUE_TITLE, "user": {"type": "Bot"}, "body": st.BODY_MARKER}
         page2 = [
-            {"number": 200, "title": st.ISSUE_TITLE, "pull_request": {}},
-            {"number": 201, "title": st.ISSUE_TITLE},
+            {"number": 199, "title": st.ISSUE_TITLE, "user": {"type": "User"}, "body": st.BODY_MARKER},
+            {"number": 200, **tracked, "pull_request": {}},
+            {"number": 201, **tracked},
         ]
         with mock.patch.object(gh, "request", side_effect=[page1, page2]) as req:
             self.assertEqual(gh.find_issue()["number"], 201)
