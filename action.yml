@@ -35,10 +35,9 @@ inputs:
     required: false
     default: ${{ github.token }}
   claude_args:
-    description: "Arguments for the Claude Code CLI. The default allows what the plugin's audit and apply use, including the shell commands the audit reads files with. The list is not a sandbox (git, python3 and uv run code); Claude Code's protected-path check, which no allow rule lifts, keeps its Edit and Write tools out of .claude/ (see README, What it can't change)."
+    description: "Arguments for the Claude Code CLI. The default turns permission prompts off; Bash runs in Claude Code's sandbox and the deny rules sit in the sandbox settings, so they hold whatever you set here (see README, Sandbox and permissions)."
     required: false
-    default: >-
-      --allowedTools "Read,Write,Edit,MultiEdit,Glob,Grep,Agent,Task,Skill,TodoWrite,Bash(git:*),Bash(python3:*),Bash(uv:*),Bash(date:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(cd:*),Bash(command -v:*)"
+    default: "--permission-mode bypassPermissions"
 
 outputs:
   mode:
@@ -103,6 +102,53 @@ runs:
         echo "Plugin: $REPO@$REF ($(git -C "$dir" rev-parse HEAD))"
         echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
+    # Claude Code runs every Bash command in its sandbox: writes stay in the workspace, the temp
+    # dir and the uv dir, and the network reaches only PyPI (strictAllowlist denies every other
+    # host). The default claude_args turn prompts off inside it, because claude -p refuses the
+    # audit's commands that use shell variables. The settings' deny rules keep WebFetch, WebSearch,
+    # MCP tools and the file tools' writes to protected and runner paths out (README: Sandbox and
+    # permissions); deny rules hold with prompts off.
+    - name: Prepare the Bash sandbox
+      id: sandbox
+      if: steps.plugin.outputs.dir != ''
+      shell: bash
+      run: |
+        # macOS uses its built-in Seatbelt; Linux needs bubblewrap and socat.
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          if ! command -v bwrap >/dev/null || ! command -v socat >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat >/dev/null
+          fi
+          # Ubuntu 24.04's AppArmor policy stops bubblewrap from making user namespaces.
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc true
+        fi
+        uv_dir="$RUNNER_TEMP/harness-stocktake-uv"
+        mkdir -p "$uv_dir/cache"
+        settings="$RUNNER_TEMP/harness-stocktake-settings.json"
+        UV_DIR="$uv_dir" python3 -I -c '
+        import json, os, sys
+        # Protected paths anywhere (the apply worktree too), the command files of the runner
+        # (GITHUB_ENV and the others), the Action code later steps run, and home dotfiles.
+        paths = ["//**/.claude/**", "//**/.mcp.json", "//**/.claude.json", "//**/.git/**",
+                 "//**/.gitmodules", "//**/.vscode/**", "//**/.devcontainer/**",
+                 "//**/_runner_file_commands/**", "//**/_actions/**", "~/.*", "~/.*/**"]
+        tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+        deny = ["WebFetch", "WebSearch", "mcp__*"] + [f"{t}({p})" for p in paths for t in tools]
+        json.dump({
+            "permissions": {"deny": deny},
+            "sandbox": {
+                "enabled": True,
+                "allowUnsandboxedCommands": False,
+                "filesystem": {"allowWrite": [os.environ["UV_DIR"] + "/**"]},
+                "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org"], "strictAllowlist": True},
+            },
+        }, open(sys.argv[1], "w"), indent=1)' "$settings"
+        cat "$settings"; echo
+        echo "settings=$settings" >> "$GITHUB_OUTPUT"
+        echo "uv_dir=$uv_dir" >> "$GITHUB_OUTPUT"
+
     - name: Audit the harness
       id: audit
       if: steps.mode.outputs.mode == 'audit'
@@ -116,6 +162,11 @@ runs:
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
         github_token: ${{ inputs.github_token }}
         claude_args: ${{ inputs.claude_args }}
+        settings: ${{ steps.sandbox.outputs.settings }}
+      env:
+        # uv writes under the sandbox's one extra writable directory (the plugin sits in ~/.claude).
+        UV_CACHE_DIR: ${{ steps.sandbox.outputs.uv_dir }}/cache
+        UV_PROJECT_ENVIRONMENT: ${{ steps.sandbox.outputs.uv_dir }}/venv
 
     - name: Update the tracked issue
       id: sync
@@ -125,12 +176,14 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         EVENT_NAME: ${{ github.event_name }}
         PLUGIN_REF: ${{ inputs.plugin_ref }}
+        EXECUTION_FILE: ${{ steps.audit.outputs.execution_file }}
       run: |
         # A pull_request run checks the PR's harness; the issue tracks the default branch.
         extra=()
         if [ "$EVENT_NAME" = "pull_request" ]; then extra=(--no-issue); fi
         python3 -I "$GITHUB_ACTION_PATH/scripts/stocktake.py" audit-sync \
-          --workspace "$GITHUB_WORKSPACE" --plugin-ref "$PLUGIN_REF" "${extra[@]}"
+          --workspace "$GITHUB_WORKSPACE" --plugin-ref "$PLUGIN_REF" \
+          --execution-file "$EXECUTION_FILE" "${extra[@]}"
 
     - name: Apply the ticked items
       id: apply
@@ -150,8 +203,8 @@ runs:
           Phase 4 would hold for "after merge" is pending here. Run Phase 4, then stop: do not merge,
           rebase or push, and keep the branch.
 
-          Claude Code denies Edit and Write on its protected paths in this run (the .claude/
-          directory, .mcp.json and the others its docs list), whatever the allowed tools say. When an
+          This run's deny rules block Edit, Write, MultiEdit and NotebookEdit on .claude/, .mcp.json,
+          .claude.json, .git, .vscode and .devcontainer, in your worktree too. When an
           item needs such an edit, do not write the file another way: leave it unchanged and record
           the item as pending, with the exact unified diff you would have applied.
 
@@ -172,6 +225,11 @@ runs:
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
         github_token: ${{ inputs.github_token }}
         claude_args: ${{ inputs.claude_args }}
+        settings: ${{ steps.sandbox.outputs.settings }}
+      env:
+        # uv writes under the sandbox's one extra writable directory (the plugin sits in ~/.claude).
+        UV_CACHE_DIR: ${{ steps.sandbox.outputs.uv_dir }}/cache
+        UV_PROJECT_ENVIRONMENT: ${{ steps.sandbox.outputs.uv_dir }}/venv
 
     - name: Push claude/stocktake and open or update the PR
       id: publish

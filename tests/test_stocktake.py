@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -347,6 +348,19 @@ class AuditSyncTest(Base):
         gh = FakeGitHub()
         self.assertEqual(self.audit(gh), 1)
         self.assertIn("audit failed", gh.issues[1]["body"])
+
+    def test_no_report_prints_claudes_last_message(self):
+        execution = self.root / "exec.json"
+        message = "I stopped: no PyPI.\n::error::forged"
+        execution.write_text(json.dumps([{"type": "result", "result": message}]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.audit(FakeGitHub(), "--execution-file", str(execution)), 1)
+        lines = out.getvalue().splitlines()
+        stop = next(i for i, line in enumerate(lines) if line.startswith("::stop-commands::"))
+        token = lines[stop].removeprefix("::stop-commands::")
+        self.assertEqual(lines[stop + 1 : stop + 3], message.splitlines())
+        self.assertEqual(lines[stop + 3], f"::{token}::")
 
     def test_pull_request_run_leaves_the_issue(self):
         self.write_run()

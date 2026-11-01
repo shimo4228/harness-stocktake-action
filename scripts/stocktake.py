@@ -24,6 +24,7 @@ import gzip
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import urllib.error
@@ -656,6 +657,11 @@ def cmd_audit_sync(args: argparse.Namespace, gh: GitHub) -> int:
     run = find_run_dir(workspace)
     if run is None:
         print("::error::The audit wrote no report (.notes/stocktake/<date>/items-all.json).")
+        last = final_message(args.execution_file)
+        if last:
+            # The runner reads `::command::` lines on stdout; the model's text must not be one.
+            token = secrets.token_hex(16)
+            print(f"Claude's last message:\n::stop-commands::{token}\n{last[:4000]}\n::{token}::")
         if args.update_issue:
             record_failure(gh, args.run_url, "audit failed: no report was written")
         return 1
@@ -1132,6 +1138,7 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("audit-sync")
     a.add_argument("--workspace", default=".")
     a.add_argument("--plugin-ref", default="")
+    a.add_argument("--execution-file", default="")
     a.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     a.add_argument(
         "--no-issue",

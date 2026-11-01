@@ -86,17 +86,17 @@ Pull request runs only write the report to that run's summary. The tracked issue
 
 ## What it can't change
 
-Claude Code does not let its Edit and Write tools write to its [protected paths](https://code.claude.com/docs/en/permission-modes#protected-paths) in a run like this one. These include the whole `.claude/` directory (`settings.json`, skills, agents, rules and hook scripts), `.mcp.json`, `.git`, `.vscode`, `.devcontainer` and a few dotfiles. The check runs before allow rules, so `--allowedTools` in `claude_args` cannot lift it, not even with a rule like `Edit(.claude/settings.json)`. Neither can a `PreToolUse` hook that answers `allow`. The run is `claude -p` under claude-code-action with no permission mode set, and in that mode a write that needs approval is denied.
+The run's deny rules stop Claude Code's file tools (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) from writing anywhere in the whole `.claude/` directory (`settings.json`, skills, agents, rules and hook scripts), `.mcp.json`, `.claude.json`, `.git`, `.gitmodules`, `.vscode` and `.devcontainer`. They apply wherever those paths are on the runner, the apply run's worktree included. These are most of Claude Code's [protected paths](https://code.claude.com/docs/en/permission-modes#protected-paths). The rules live in the sandbox settings the Action writes, not in `claude_args`, and they hold with permission prompts off (see [Sandbox and permissions](#sandbox-and-permissions)).
 
 | Item | In the Action |
 |---|---|
 | Edits `CLAUDE.md`, `docs/`, or other files outside the protected paths | Applied on the branch |
-| Retires (deletes) a file under `.claude/`, for example a skill or a hook script | Applied on the branch: the plugin deletes with `git rm`, which the check doesn't cover |
+| Retires (deletes) a file under `.claude/`, for example a skill or a hook script | Applied on the branch when the plugin's `git rm` can delete it. The sandbox blocks shell writes to the checkout's `.claude/settings*.json`, `.claude/skills` and `.claude/hooks`, so a retirement there ends as pending |
 | Edits a file under `.claude/`, or retires an entry in `.claude/settings.json` (a hook, a permission) | ✋ *by hand*. The pull request lists it as pending, with the diff when the apply run recorded one |
 
 The issue marks the ✋ *by hand* items before you tick anything. The mark is a forecast from the item's target and verdict. A Merge whose only `.claude/` change is a deletion can still land on the branch, and the pull request says which items did.
 
-Only `--permission-mode bypassPermissions` lets Claude Code write these paths. That mode also turns off the allowlist for every tool, so the Action doesn't use it.
+Shell commands are held by the sandbox instead. Claude Code's sandbox refuses Bash writes to `.git/hooks`, `.git/config`, `.gitmodules` and the checkout's `.claude/` settings, skills and hooks; it lets them write other files in the workspace. Whatever the run writes reaches your default branch only through the pull request you merge.
 
 ## Keeping the schedule alive
 
@@ -104,7 +104,7 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 
 ## What it sends, and what it changes
 
-- **Your credential, your account.** The run uses the token or API key you stored. The Action's author never receives a token, a report, or usage data, and the Action has no telemetry. The only outside traffic is the Claude Code session itself: it sends your repository content to Anthropic under your credential, the same as running Claude Code locally. GitHub API calls go to your own repository.
+- **Your credential, your account.** The run uses the token or API key you stored. The Action's author never receives a token, a report, or usage data, and the Action has no telemetry. The only outside traffic is the Claude Code session itself: it sends your repository content to Anthropic under your credential, the same as running Claude Code locally. GitHub API calls go to your own repository. The model's shell commands reach only PyPI, for the plugin's Python dependencies (see [Sandbox and permissions](#sandbox-and-permissions)). They can still read the job's environment, the run's credentials included, and the run posts what the model writes to the issue and the pull request; a public repository whose harness includes third-party skills is exposed to that through prompt injection.
 - **No change without your merge.** The Action pushes to one branch only, `claude/stocktake`, and it never pushes to your default branch. It writes nothing to that branch until you tick items. Nothing reaches the default branch until you merge the pull request.
 - **Your repository's own Claude settings apply.** The run is Claude Code inside your repository, so hooks in your committed `.claude/settings.json` run during it. Pull requests from forks are skipped: they get no secrets, and their harness is not yours.
 - `claude/stocktake` belongs to the Action, and each apply force-pushes it. Don't commit to it by hand.
@@ -125,28 +125,34 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 | `plugin_ref` | `v0.1.0` | The harness-stocktake tag, branch, or commit to run. |
 | `plugin_repository` | `shimo4228/harness-stocktake` | Where the plugin marketplace lives. |
 | `plugin_token` | `github.token` | Read access to `plugin_repository`. Only needed while that repository is private. |
-| `claude_args` | allowed tools for the plugin | Passed through to the Claude Code CLI. See [Allowed tools](#allowed-tools) for the default. The list is not a sandbox. Claude Code's protected-path check, which no allow rule lifts, keeps its Edit and Write tools out of `.claude/` (see [What it can't change](#what-it-cant-change)). |
+| `claude_args` | `--permission-mode bypassPermissions` | Passed through to the Claude Code CLI. See [Sandbox and permissions](#sandbox-and-permissions). The deny rules are in the sandbox settings, so setting your own arguments keeps them. |
 
 Outputs: `mode`, `issue_number`, `pr_url`.
 
-### Allowed tools
+### Sandbox and permissions
 
-The default `claude_args` passes `--allowedTools` with what the plugin uses:
+The plugin's model reads the harness with shell commands such as `for f in .claude/hooks/*.sh; do cat -n "$f"; done`. In a `claude -p` run, Claude Code refuses any command that uses a shell variable before it runs, and no allow rule changes that. So the Action runs the model's Bash in Claude Code's [sandbox](https://code.claude.com/docs/en/sandboxing) and turns permission prompts off inside it:
 
-- Claude Code's file tools: `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep`, plus `Agent`, `Task`, `Skill` and `TodoWrite`.
-- `git`, `python3` and `uv`, which the plugin's scripts run with.
-- Shell commands the audit reads the harness with: `cat`, `head`, `tail`, `grep`, `ls`, `wc`, `cd`, `date` and `command -v`, plus `mkdir` for its notes. Without them the audit stops on permission denials and writes no report. `find` and `sort` are left out: `find -exec` starts any command and `find -delete` and `sort -o` write files. The `Glob` tool finds files instead.
+- **Bash runs in the sandbox.** A step before Claude Code starts prepares it: on Linux it installs `bubblewrap` and `socat` and, on Ubuntu 24.04, lifts the AppArmor limit on user namespaces. macOS uses its built-in Seatbelt. The settings it passes to claude-code-action:
+  - writes: the workspace, the temp directory, and `$RUNNER_TEMP/harness-stocktake-uv` (uv's cache and environment; the plugin itself is installed under `~/.claude`, where the sandbox refuses writes). Nothing else, the home directory included.
+  - network: `pypi.org` and `files.pythonhosted.org` only, with `strictAllowlist`, so every other host is refused. `allowUnsandboxedCommands: false`, so no command retries outside the sandbox.
+- **Prompts are off**: `--permission-mode bypassPermissions`. Allow rules do nothing in this mode, so the default has no `--allowedTools`.
+- **Deny rules** in the same settings, which hold in every mode:
+  - `WebFetch`, `WebSearch` and every MCP tool (`mcp__*`). They run outside the sandbox, and claude-code-action turns on the servers in your `.mcp.json`.
+  - `Edit`, `Write`, `MultiEdit` and `NotebookEdit` on the protected paths (see [What it can't change](#what-it-cant-change)). The file tools aren't sandboxed, so the same four are also denied on the runner's command files (`GITHUB_ENV` and the others), the Action code the later steps run, and the dotfiles in the home directory.
 
-It allows no command whose job is to reach the network or start another shell (`curl`, `wget`, `gh`, `nc`, `ssh`, `bash`, `sh`, `env`, `eval`). `command` is allowed only as `command -v`, because `command <name>` runs any command. The list is not a sandbox: `git`, `python3` and `uv` can run code and write files. What keeps Claude Code's Edit and Write tools out of `.claude/` and the other protected paths is its protected-path check (see [What it can't change](#what-it-cant-change)), not this list; a `git`, `python3` or `uv` command is not covered by that check. If you set `claude_args` yourself, start from this list.
+The sandbox is not a wall around your repository: inside the workspace, shell commands can read anything and write everything but the paths above. What stays outside the run's reach is the network (other than PyPI and Claude Code's own connection to Anthropic) and every file outside the workspace and the temp directories. Your repository's own `.claude/settings.json` is loaded too and can widen these settings, as it can add hooks; the Action trusts it as it trusts the rest of your harness. The default branch changes only through the pull request you merge.
 
-Needs a Linux or macOS runner, with `git` and Python 3.10 or later. GitHub-hosted runners have both.
+If you set `claude_args` yourself, keep `--permission-mode bypassPermissions`: without it the audit stops on permission denials and writes no report.
+
+Needs a GitHub-hosted Linux or macOS runner (`sudo` for the packages on Linux), with `git` and Python 3.11 or later (the plugin's scripts need it, and the sandbox keeps uv from downloading one).
 
 ## Differences from the plan
 
 - `plugin_marketplaces` in claude-code-action v1 accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
 - Ticking an issue box needs a trigger, so the workflow also listens to `issues: edited`. The job runs only when the tracked issue's **Apply** box is ticked.
 - Pull request runs report to the run summary only and leave the tracked issue alone (see above).
-- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary. A diff that fits is shown whole and as written, in a code block; one that doesn't is replaced by a note with its length, never shown cut.
+- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary, which holds every pending item's note, diff and approved change in full. A diff that fits is shown whole and as written, in a code block; one that doesn't is replaced by a note with its length, never shown cut.
 
 ## Development
 
