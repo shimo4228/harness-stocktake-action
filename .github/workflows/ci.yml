@@ -29,7 +29,7 @@ jobs:
           for step in action["runs"]["steps"]:
               if "run" not in step:
                   continue
-              script = "#!/usr/bin/env bash\n" + step["run"].replace("${{", "__").replace("}}", "__")
+              script = "#!/usr/bin/env bash\n" + step["run"].replace("$" + "{{", "__").replace("}}", "__")
               r = subprocess.run(["shellcheck", "-s", "bash", "-"], input=script, text=True)
               bad |= r.returncode
           sys.exit(bad)
