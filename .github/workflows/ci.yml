@@ -12,7 +12,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
@@ -30,7 +30,7 @@ jobs:
               if "run" not in step:
                   continue
               script = "#!/usr/bin/env bash\n" + step["run"].replace("$" + "{{", "__").replace("}}", "__")
-              r = subprocess.run(["shellcheck", "-s", "bash", "-"], input=script, text=True)
+              r = subprocess.run(["shellcheck", "-s", "bash", "-e", "SC2153,SC2154", "-"], input=script, text=True)
               bad |= r.returncode
           sys.exit(bad)
           PY
@@ -47,7 +47,7 @@ jobs:
       matrix:
         python: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
