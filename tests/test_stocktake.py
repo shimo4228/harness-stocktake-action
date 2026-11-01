@@ -628,7 +628,7 @@ class ProtectedPathTest(unittest.TestCase):
         self.assertEqual(
             hand,
             {
-                "hooks-02": False,  # a Retire is a git rm, which Claude Code allows
+                "hooks-02": True,  # the sandbox refuses git rm under .claude/
                 "hooks-03": True,  # retiring a hook entry edits settings.json
                 "docs-01": False,
                 "docs-03": False,
@@ -650,7 +650,7 @@ class IssueTagsTest(unittest.TestCase):
         rows = {ln.split("`")[1]: ln for ln in body.splitlines() if st.CHECKBOX.match(ln)}
         self.assertIn(st.TAG_HAND, rows["hooks-03"])
         self.assertIn(st.TAG_HAND, rows["skills-02"])
-        self.assertNotIn(st.TAG_HAND, rows["hooks-02"])
+        self.assertIn(st.TAG_HAND, rows["hooks-02"])
         self.assertNotIn(st.TAG_HAND, rows["docs-01"])
         self.assertIn(st.README_URL, body)
         # The tag does not get in the way of reading the boxes.
@@ -673,7 +673,7 @@ class ItemStatusTest(unittest.TestCase):
     def test_the_branch_decides(self):
         approved = [SMOKE_ITEMS[0], SMOKE_ITEMS[1], SMOKE_ITEMS[2]]
         changed = {".claude/hooks/notify-done.sh", "CLAUDE.md"}
-        status = st.item_status(approved, changed, {})
+        status = st.item_status(approved, changed, {"hooks-02": {"outcome": "applied"}})
         self.assertEqual(
             {k: v["status"] for k, v in status.items()},
             {"hooks-02": "applied", "hooks-03": "pending", "docs-01": "applied"},
@@ -709,7 +709,8 @@ class ItemStatusTest(unittest.TestCase):
         retire_dir = item("skills-09", "Retire", ".claude/skills/old")
         glob = item("skills-08", "Retire", ".claude/skills/pack-*/SKILL.md")
         changed = {".claude/skills/old/SKILL.md", ".claude/skills/pack-a/SKILL.md"}
-        status = st.item_status([retire_dir, glob], changed, {})
+        claims = {"skills-09": {"outcome": "applied"}, "skills-08": {"outcome": "applied"}}
+        status = st.item_status([retire_dir, glob], changed, claims)
         self.assertEqual({v["status"] for v in status.values()}, {"applied"})
 
     def test_every_path_must_change(self):
@@ -746,7 +747,10 @@ class ItemStatusTest(unittest.TestCase):
 
 
 class SmokePublishTest(Base):
-    """The smoke test's apply: hooks-02 and docs-01 committed, hooks-03 (settings.json) denied."""
+    """The smoke test's apply: hooks-02 and docs-01 committed with no outcomes.json, hooks-03 denied.
+
+    hooks-02 retires a file under .claude/, so without the run's own record it stays pending.
+    """
 
     def setUp(self):
         super().setUp()
@@ -796,23 +800,24 @@ class SmokePublishTest(Base):
         body = self.gh.prs[0]["body"]
         applied, pending = body.split("**Pending, apply by hand")
         pending = pending.split("### Commits")[0]
-        self.assertIn("`hooks-02`", applied)
         self.assertIn("`docs-01`", applied)
+        self.assertNotIn("`hooks-02`", applied)
         self.assertNotIn("`hooks-03`", applied)
+        self.assertIn("`hooks-02`", pending)
         self.assertIn("`hooks-03`", pending)
         self.assertIn("### Pending items", pending)
-        self.assertIn("2 applied", body)
-        self.assertIn("1 left for you to apply by hand", body)
+        self.assertIn("1 applied", body)
+        self.assertIn("2 left for you to apply by hand", body)
         # No diff was recorded: the approved change stands in for it.
         self.assertIn("change hooks-03", pending)
 
         issue = self.gh.issues[1]["body"]
         rows = {ln.split("`")[1]: ln for ln in issue.splitlines() if st.CHECKBOX.match(ln)}
-        self.assertIn(st.TAG_APPLIED, rows["hooks-02"])
+        self.assertIn(st.TAG_PENDING, rows["hooks-02"])
         self.assertIn(st.TAG_APPLIED, rows["docs-01"])
         self.assertIn(st.TAG_PENDING, rows["hooks-03"])
         self.assertIn(st.TAG_HAND, rows["skills-02"])  # not ticked: still the up-front flag
-        self.assertIn("applied 2 of 3 item(s), 1 pending", issue)
+        self.assertIn("applied 1 of 3 item(s), 2 pending", issue)
 
     def test_pending_diff_comes_from_outcomes_json(self):
         run = self.root / st.REPORT_ROOT / "2026-11-01"
@@ -1108,7 +1113,7 @@ class SmokePublishTest(Base):
         rerendered = st.render_body(data, marks)
         rows = {ln.split("`")[1]: ln for ln in rerendered.splitlines() if st.CHECKBOX.match(ln)}
         self.assertNotIn(st.TAG_APPLIED, rows["docs-01"])
-        self.assertIn(st.TAG_APPLIED, rows["hooks-02"])
+        self.assertIn(st.TAG_PENDING, rows["hooks-02"])
 
     def test_no_commit_marks_every_ticked_item_pending(self):
         self.assertEqual(self.publish(log="", changed=""), 0)

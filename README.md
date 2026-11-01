@@ -91,10 +91,10 @@ The run's deny rules stop Claude Code's file tools (`Edit`, `Write`, `MultiEdit`
 | Item | In the Action |
 |---|---|
 | Edits `CLAUDE.md`, `docs/`, or other files outside the protected paths | Applied on the branch |
-| Retires (deletes) a file under `.claude/`, for example a skill or a hook script | Applied on the branch when the plugin's `git rm` can delete it. The sandbox blocks shell writes to the checkout's `.claude/settings*.json`, `.claude/skills` and `.claude/hooks`, so a retirement there ends as pending |
+| Retires (deletes) a file under `.claude/`, for example a skill or a hook script | ✋ *by hand*. The plugin deletes with `git rm`, which the deny rules don't cover, but the Bash sandbox refuses it there. The pull request lists the item as pending, with the deletion diff |
 | Edits a file under `.claude/`, or retires an entry in `.claude/settings.json` (a hook, a permission) | ✋ *by hand*. The pull request lists it as pending, with the diff when the apply run recorded one |
 
-The issue marks the ✋ *by hand* items before you tick anything. The mark is a forecast from the item's target and verdict. A Merge whose only `.claude/` change is a deletion can still land on the branch, and the pull request says which items did.
+The issue marks the ✋ *by hand* items before you tick anything. The mark is a forecast from the item's target and verdict. The pull request says which items landed.
 
 Shell commands are held by the sandbox instead. Claude Code's sandbox refuses Bash writes to `.git/hooks`, `.git/config`, `.gitmodules` and the checkout's `.claude/` settings, skills and hooks; it lets them write other files in the workspace. Whatever the run writes reaches your default branch only through the pull request you merge.
 

@@ -307,15 +307,15 @@ def _is_config(path: str) -> bool:
 
 
 def needs_hand(item: Item) -> bool:
-    """An item the Action cannot apply: it edits a protected path.
+    """An item the Action cannot apply: it edits a protected path or a config file.
 
-    A Retire of a protected file is a `git rm`, which Claude Code allows, unless the file is a
-    config whose entries the item edits (`.claude/settings.json`, `.mcp.json`).
+    A Retire is a `git rm`, which the deny rules don't cover, but the run's Bash sandbox refuses
+    it under `.claude/`. A Retire of another protected file (`.pre-commit-config.yaml`) lands.
     """
     paths = item_paths(item)
-    if any(_is_config(p) for p in paths):
-        return True
-    return verdict_group(str(item.get("verdict", ""))) != "Retire" and any(map(is_protected, paths))
+    if verdict_group(str(item.get("verdict", ""))) == "Retire":
+        return any(_is_config(p) or ".claude" in p.split("/")[:-1] for p in paths)
+    return any(is_protected(p) or _is_config(p) for p in paths)
 
 
 def _matches(path: str, changed: set[str]) -> set[str]:
