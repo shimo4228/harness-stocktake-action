@@ -76,10 +76,10 @@ jobs:
 2. **Issue.** The Action keeps one open issue titled **Harness stocktake** and rewrites its body in place on every run. It lists each item to change with a checkbox and shows the date of the last run. Items start unticked. A box you ticked stays ticked in the next report if the same finding comes back.
 3. **Tick.** Tick the items you approve, then tick **Apply the ticked items** at the bottom. Items marked ✋ *by hand* edit a path the Action cannot change (see [What it can't change](#what-it-cant-change)). You can tick them, but you apply them yourself.
 4. **Pull request.** That edit starts an apply run. It applies only the ticked items, commits them, and force-pushes the result to the fixed branch `claude/stocktake`. Then it opens a pull request, or updates the open one. The pull request splits the approved items in two:
-   - **Applied:** the branch's commits change every file the item names.
+   - **Applied:** merging the branch changes every file the item names.
    - **Pending, apply by hand:** the branch leaves some or all of the item's files alone. Each one comes with the apply run's note and diff, or with the approved change when the run recorded no diff. An item that is only partly on the branch says which files landed and what is left.
 
-   The Action reads the status from the branch itself: the files the branch's commits change, matched to each item's targets. It does not read it from the model's report. An item that also edits a path the Action can't change (✋) counts as applied only when the apply run recorded it as applied, because its protected part can be missing while the rest landed. The pull request also carries the commits and the plugin's completion report. The tracked issue marks each ticked item ✅ *applied* or ✋ **pending, apply by hand** until the next audit. The mark goes away when you untick the item.
+   The Action reads the status from the branch itself: the files that merging the branch would change, matched to each item's targets. It does not read it from the model's report. An item that also edits a path the Action can't change (✋) counts as applied only when the apply run recorded it as applied, because its protected part can be missing while the rest landed. The pull request also carries the commits and the plugin's completion report. The tracked issue marks each ticked item ✅ *applied* or ✋ **pending, apply by hand**. The mark stays until the next apply or audit rewrites the issue. Unticking an item is an issue edit that starts no run, so its mark stays visible until then, but the next apply leaves the item out.
 5. **Merge.** Merging is the one approval. Pending items are not in it: apply them yourself, on the branch or after the merge. To drop an item, untick it and tick **Apply** again. The branch is rebuilt without it.
 
 Pull request runs only write the report to that run's summary. The tracked issue follows the default branch, so a pull request run leaves it alone.
@@ -125,9 +125,19 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 | `plugin_ref` | `v0.1.0` | The harness-stocktake tag, branch, or commit to run. |
 | `plugin_repository` | `shimo4228/harness-stocktake` | Where the plugin marketplace lives. |
 | `plugin_token` | `github.token` | Read access to `plugin_repository`. Only needed while that repository is private. |
-| `claude_args` | allowed tools for the plugin | Passed through to the Claude Code CLI. No allow rule here lets it edit `.claude/` (see [What it can't change](#what-it-cant-change)). |
+| `claude_args` | allowed tools for the plugin | Passed through to the Claude Code CLI. No allow rule here lets it edit `.claude/` (see [What it can't change](#what-it-cant-change)). See [Allowed tools](#allowed-tools) for the default. |
 
 Outputs: `mode`, `issue_number`, `pr_url`.
+
+### Allowed tools
+
+The default `claude_args` passes `--allowedTools` with what the plugin uses:
+
+- Claude Code's file tools: `Read`, `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep`, plus `Agent`, `Task`, `Skill` and `TodoWrite`.
+- `git`, `python3` and `uv`, which the plugin's scripts run with.
+- Shell commands the audit reads the harness with: `cat`, `head`, `tail`, `grep`, `find`, `ls`, `wc`, `sort`, `cd`, `date` and `command -v`, plus `mkdir` for its notes. Without them the audit stops on permission denials and writes no report.
+
+It allows no command whose job is to reach the network or start another shell (`curl`, `wget`, `gh`, `nc`, `ssh`, `bash`, `sh`, `env`, `eval`). `command` is allowed only as `command -v`, because `command <name>` runs any command. The list is not a sandbox: `git`, `python3` and `uv` can run code, and Claude Code's own checks decide what a compound command may do. If you set `claude_args` yourself, start from this list.
 
 Needs a Linux or macOS runner, with `git` and Python 3.10 or later. GitHub-hosted runners have both.
 
@@ -136,7 +146,7 @@ Needs a Linux or macOS runner, with `git` and Python 3.10 or later. GitHub-hoste
 - `plugin_marketplaces` in claude-code-action v1 accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
 - Ticking an issue box needs a trigger, so the workflow also listens to `issues: edited`. The job runs only when the tracked issue's **Apply** box is ticked.
 - Pull request runs report to the run summary only and leave the tracked issue alone (see above).
-- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs first, then the completion report.
+- The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary. Diffs are shown as written, in a code block.
 
 ## Development
 
