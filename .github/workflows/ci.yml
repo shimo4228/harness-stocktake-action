@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color .github/workflows/*.yml examples/*.yml
+      - name: action.yml schema and shell
+        run: |
+          python3 -m pip install --quiet pyyaml
+          # actionlint reads workflows only; action.yml's run: blocks go through shellcheck here.
+          python3 - <<'PY'
+          import yaml, pathlib, subprocess, sys
+          action = yaml.safe_load(pathlib.Path("action.yml").read_text())
+          assert action["runs"]["using"] == "composite"
+          bad = 0
+          for step in action["runs"]["steps"]:
+              if "run" not in step:
+                  continue
+              script = "#!/usr/bin/env bash\n" + step["run"].replace("$" + "{{", "__").replace("}}", "__")
+              r = subprocess.run(["shellcheck", "-s", "bash", "-e", "SC2153,SC2154", "-"], input=script, text=True)
+              bad |= r.returncode
+          sys.exit(bad)
+          PY
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: format --check
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
