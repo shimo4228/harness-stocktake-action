@@ -357,9 +357,9 @@ def item_status(approved: list[Item], changed: set[str], outcomes: dict[str, Ite
             and (claimed in ("applied", "reevaluated") or not needs_hand(i))
         )
         entry: Item = {"status": "applied" if applied else "pending"}
-        for key in ("note", "diff"):
+        for key in ("note", "diff"):  # whole: pr_body decides what fits, and says when it doesn't
             if record.get(key):
-                entry[key] = str(record[key])[:20_000]
+                entry[key] = str(record[key])
         if not applied and hits[id_]:
             entry["partial"] = sorted(hits[id_])
             if "note" not in entry:
@@ -369,8 +369,8 @@ def item_status(approved: list[Item], changed: set[str], outcomes: dict[str, Ite
                     f"{left}. Finish it by hand."
                 )
         if applied and claimed != "applied":
-            # No explicit claim for this item, yet its file also belongs to another one: the change
-            # on the branch may be the other item's alone.
+            # The run did not record this item as applied, yet its file also belongs to another one:
+            # the change on the branch may be the other item's alone.
             shared = sorted({o for f in hits[id_] for o in owners[f]} - {id_})
             if shared:
                 entry["shared"] = shared
@@ -904,6 +904,24 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 1, 0)].rstrip() + "…"
 
 
+CHANGE_FLOOR = 500  # an approved change this short is always shown whole
+
+
+def _pending_line(item: Item) -> str:
+    hand = " · Claude Code cannot edit this path in the Action" if needs_hand(item) else ""
+    return f"- {_label(item)}{hand} — see [Pending items](#pending-items)"
+
+
+def _drop_dead_links(body: str, pending: list[Item]) -> str:
+    """After a cut, a pending item whose section is gone no longer links to it."""
+    for i in pending:
+        if f"#### {_label(i)}" not in body:
+            line = _pending_line(i)
+            cut = line.replace("see [Pending items](#pending-items)", "details: see the run's summary")
+            body = body.replace(line, cut)
+    return body
+
+
 def pr_body(
     data: dict[str, Any],
     approved: list[Item],
@@ -960,8 +978,7 @@ def pr_body(
         "",
     ]
     for i in pending:
-        hand = " · Claude Code cannot edit this path in the Action" if needs_hand(i) else ""
-        lines.append(f"- {_label(i)}{hand} — see [Pending items](#pending-items)")
+        lines.append(_pending_line(i))
     if not pending:
         lines.append("- none")
     if pending:
@@ -989,7 +1006,7 @@ def pr_body(
                     ),
                     "",
                 ]
-            elif len(change) <= diff_limit:
+            elif len(change) <= max(diff_limit, CHANGE_FLOOR):
                 more = "; the completion report below may say more" if has_report else ""
                 lines += [
                     f"The apply run recorded no diff for it. The approved change is below{more}.",
@@ -1070,7 +1087,8 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
         # Still too long (a very long commit list): cut, then close what the cut left open.
         tail = "\n\n… (cut to fit GitHub's limit)\n"
         size = MAX_BODY - len(tail)
-        while len(closed := _close_blocks(body[:size]) + tail) > MAX_BODY:
+        pending = [i for i in approved if status[str(i["id"])]["status"] == "pending"]
+        while len(closed := _drop_dead_links(_close_blocks(body[:size]), pending) + tail) > MAX_BODY:
             size -= len(closed) - MAX_BODY
         body = closed
     title = f"Harness stocktake {data.get('report_date')}"
