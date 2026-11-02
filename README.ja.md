@@ -104,7 +104,7 @@ issue は、チェックを入れる前から ✋ *by hand* の項目に印を�
 
 ## 定期実行を止めないために
 
-GitHub は、リポジトリに 60 日間動きが無いと定期実行のワークフローを一時停止します。追跡用 issue には最後に実行した日付が出ます。その日付が 1 か月より前なら、**Actions → Harness stocktake → Run workflow**（`workflow_dispatch`）から実行を始めるか、GitHub がワークフローを無効にしていれば有効に戻します。
+公開リポジトリでは、60 日間動きが無いと GitHub が定期実行のワークフローを無効にします（[GitHub Docs](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)（英語）、2026-11-02 時点）。追跡用 issue には最後に実行した日付が出ます。その日付が 1 か月より前なら、**Actions → Harness stocktake → Run workflow**（`workflow_dispatch`）から実行を始めるか、GitHub がワークフローを無効にしていれば有効に戻します。
 
 ## 何を送り、何を変えるか
 
@@ -155,7 +155,7 @@ GitHub ホストの Linux か macOS のランナーが必要で（Linux では�
 
 - `plugin_ref` の既定値は plugin のリリースタグです。plugin のリリースは変更できない GitHub リリースなのでタグは動かず、実行は取得したコミットをログに残します。
 - `v1` はただのタグで、リリースではありません。`.github/workflows/major-tag.yml` が、公開された `v1.x.y` のリリースのたびにそこへ動かします。
-- claude-code-action v1 の `plugin_marketplaces` は `https://….git` の URL かローカルのパスしか受け付けないので、`owner/repo` も `#ref` での固定も拒否されます。Action は `plugin_ref` の plugin を取得し、そのローカルのパスを渡します。
+- claude-code-action v1 の `plugin_marketplaces` は、`https://….git` の URL かローカルのパスしか受け付けません（この Action が固定している v1.0.266 で確認）。そのため `owner/repo` も `#ref` での固定も拒否されます。Action は `plugin_ref` の plugin を取得し、そのローカルのパスを渡します。
 - issue のボックスにチェックを入れたことを拾うにはトリガーが要るので、ワークフローは `issues: edited` も待ち受けます。ジョブが走るのは、追跡用 issue の **Apply** ボックスにチェックが入っているときだけです。
 - プルリクエストでの実行は実行のサマリーにだけ報告し、追跡用 issue には触れません（上を参照）。
 - 適用の実行には GitHub Actions で動いていることを伝えます。Action がブランチをプッシュしてプルリクエストを開き、plugin の ff-only マージの代わりをマージが務めます。適用の実行は、ワークスペースに（ブランチにではなく）`.notes/stocktake/<date>/outcomes.json` も書きます。これは項目ごとの結果・メモ・diff で、プルリクエストが保留の項目に表示する中身です。このファイルは項目を保留にはできますが、適用済みにはできません。それができるのはブランチだけです。プルリクエストの本文は GitHub のサイズ上限に収まるように短くします。長い diff、メモ、完了報告を段階的に縮め、省いた箇所には実行のサマリーへの案内を置きます。サマリーには、保留の各項目のメモ・diff・承認された変更が全部載っています。収まる diff はそのままの形でコードブロックに丸ごと載せ、収まらないものは長さを記したメモに置き換えます。途中で切って載せることはありません。

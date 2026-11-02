@@ -104,7 +104,7 @@ Shell commands are held by the sandbox instead. Claude Code's sandbox refuses Ba
 
 ## Keeping the schedule alive
 
-GitHub pauses scheduled workflows after 60 days without repository activity. The tracked issue shows the date of the last run. If that date is more than a month old, start a run from **Actions → Harness stocktake → Run workflow** (`workflow_dispatch`), or re-enable the workflow if GitHub disabled it.
+In a public repository, GitHub disables scheduled workflows after 60 days without repository activity ([GitHub Docs](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule), as of 2026-11-02). The tracked issue shows the date of the last run. If that date is more than a month old, start a run from **Actions → Harness stocktake → Run workflow** (`workflow_dispatch`), or re-enable the workflow if GitHub disabled it.
 
 ## What it sends, and what it changes
 
@@ -155,7 +155,7 @@ Needs a GitHub-hosted Linux or macOS runner (`sudo` for the packages on Linux), 
 
 - `plugin_ref` defaults to a plugin release tag. Plugin releases are immutable GitHub releases, so the tag cannot move, and the run logs the commit it fetched.
 - `v1` is a plain tag, not a release. `.github/workflows/major-tag.yml` moves it to each published `v1.x.y` release.
-- `plugin_marketplaces` in claude-code-action v1 accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
+- `plugin_marketplaces` in claude-code-action v1 (checked in v1.0.266, the version this Action pins) accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
 - Ticking an issue box needs a trigger, so the workflow also listens to `issues: edited`. The job runs only when the tracked issue's **Apply** box is ticked.
 - Pull request runs report to the run summary only and leave the tracked issue alone (see above).
 - The apply run is told it runs in GitHub Actions: the Action pushes the branch and opens the pull request, and the merge stands in for the plugin's ff-only merge. It also writes `.notes/stocktake/<date>/outcomes.json` in the workspace (not on the branch), the per-item outcome, note and diff that the pull request shows for pending items. That file can mark an item pending, but it cannot mark one applied: only the branch can. The pull request body is shortened to fit GitHub's size limit: long diffs, notes and the completion report shrink step by step, and anything they leave out points to the run's summary, which holds every pending item's note, diff and approved change in full. A diff that fits is shown whole and as written, in a code block; one that doesn't is replaced by a note with its length, never shown cut.
