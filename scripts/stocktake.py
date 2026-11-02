@@ -1082,7 +1082,7 @@ def cmd_apply_publish(args: argparse.Namespace, gh: GitHub, git: Git = run_git) 
         append_summary(args.summary, pending_details(pending_now, status))
     if not log:
         data["last_run"] = stamp(args.run_url, "apply made no commit")
-        data["note"] = "The apply run made no commit, so every ticked item is pending; see the run log."
+        data["note"] = "The apply run made no commit, so every ticked item is pending; see the run's summary."
         gh.update_issue(issue["number"], render_body(data, marks))
         print("::warning::The apply run made no commit.")
         return 0
