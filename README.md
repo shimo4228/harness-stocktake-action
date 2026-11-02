@@ -76,7 +76,7 @@ jobs:
 
 ## What happens
 
-1. **Audit** (monthly, by hand, or on a pull request that touches `.claude/**` or `CLAUDE.md`). The Action runs `/harness-stocktake:harness-stocktake --project .` through [claude-code-action](https://github.com/anthropics/claude-code-action). The full report appears in the run's summary.
+1. **Audit** (monthly, by hand, or on a pull request that touches `.claude/**` or `CLAUDE.md`). The Action runs `/harness-stocktake:harness-stocktake --project . --dry-run` (Phases 1–3, a Markdown report) through [claude-code-action](https://github.com/anthropics/claude-code-action). The full report appears in the run's summary.
 2. **Issue.** The Action keeps one open issue titled **Harness stocktake** and rewrites its body in place on every run. It lists each item to change with a checkbox and shows the date of the last run. Items start unticked. A box you ticked stays ticked in the next report if the same finding comes back.
 3. **Tick.** Tick the items you approve, then tick **Apply the ticked items** at the bottom. Items marked ✋ *by hand* edit a path the Action cannot change (see [What it can't change](#what-it-cant-change)). You can tick them, but you apply them yourself.
 4. **Pull request.** That edit starts an apply run. It applies only the ticked items, commits them, and force-pushes the result to the fixed branch `claude/stocktake`. Then it opens a pull request, or updates the open one. The pull request splits the approved items in two:
@@ -126,7 +126,7 @@ On a sample harness (4 skills, 1 rule, 1 agent, 2 hooks), an audit run took abou
 | `anthropic_api_key` | — | Your Anthropic API key. |
 | `github_token` | `github.token` | Used for the issue, the push, and the pull request. |
 | `mode` | `auto` | `auto`: an `issues` event applies, and any other event audits. Can also be `audit` or `apply`. |
-| `plugin_ref` | `v0.1.0` | The harness-stocktake tag, branch, or commit to run. |
+| `plugin_ref` | `v0.2.0` | The harness-stocktake tag, branch, or commit to run. |
 | `plugin_repository` | `shimo4228/harness-stocktake` | Where the plugin marketplace lives. |
 | `plugin_token` | `github.token` | Read access to `plugin_repository`. Needed only when it is a private repository. |
 | `claude_args` | `--permission-mode bypassPermissions` | Passed through to the Claude Code CLI. See [Sandbox and permissions](#sandbox-and-permissions). The deny rules are in the sandbox settings, so setting your own arguments keeps them. |
@@ -143,6 +143,7 @@ The plugin's model reads the harness with shell commands such as `for f in .clau
 - **Prompts are off**: `--permission-mode bypassPermissions`. Allow rules do nothing in this mode, so the default has no `--allowedTools`.
 - **Deny rules** in the same settings, which hold in every mode:
   - `WebFetch`, `WebSearch` and every MCP tool (`mcp__*`). They run outside the sandbox, and claude-code-action turns on the servers in your `.mcp.json`.
+  - `Artifact`, `ArtifactData` and `ArtifactComments`. A session signed in with an OAuth token can have them, and the plugin publishes its report as an Artifact when it can, a private page in the token owner's claude.ai account.
   - `Edit`, `Write`, `MultiEdit` and `NotebookEdit` on the protected paths (see [What it can't change](#what-it-cant-change)). The file tools aren't sandboxed, so the same four are also denied on the runner's command files (`GITHUB_ENV` and the others), the Action code the later steps run, and the dotfiles in the home directory.
 
 The sandbox is not a wall around your repository: inside the workspace, shell commands can read anything and write everything but the paths above. What stays outside the run's reach is the network (other than PyPI and Claude Code's own connection to Anthropic) and every file outside the workspace and the temp directories. Your repository's own `.claude/settings.json` is loaded too and can widen these settings, as it can add hooks; the Action trusts it as it trusts the rest of your harness. The default branch changes only through the pull request you merge.

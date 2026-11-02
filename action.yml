@@ -25,7 +25,7 @@ inputs:
   plugin_ref:
     description: "Tag, branch or commit of harness-stocktake to run. Pinned so a plugin release never changes a run unannounced."
     required: false
-    default: "v0.1.0"
+    default: "v0.2.0"
   plugin_repository:
     description: "Repository that holds the harness-stocktake marketplace."
     required: false
@@ -106,8 +106,8 @@ runs:
     # dir and the uv dir, and the network reaches only PyPI (strictAllowlist denies every other
     # host). The default claude_args turn prompts off inside it, because claude -p refuses the
     # audit's commands that use shell variables. The settings' deny rules keep WebFetch, WebSearch,
-    # MCP tools and the file tools' writes to protected and runner paths out (README: Sandbox and
-    # permissions); deny rules hold with prompts off.
+    # MCP tools, the Artifact tools and the file tools' writes to protected and runner paths out
+    # (README: Sandbox and permissions); deny rules hold with prompts off.
     - name: Prepare the Bash sandbox
       id: sandbox
       if: steps.plugin.outputs.dir != ''
@@ -135,7 +135,7 @@ runs:
                  "//**/.gitmodules", "//**/.vscode/**", "//**/.devcontainer/**",
                  "//**/_runner_file_commands/**", "//**/_actions/**", "~/.*", "~/.*/**"]
         tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
-        deny = ["WebFetch", "WebSearch", "mcp__*"] + [f"{t}({p})" for p in paths for t in tools]
+        deny = ["WebFetch", "WebSearch", "mcp__*", "Artifact", "ArtifactData", "ArtifactComments"] + [f"{t}({p})" for p in paths for t in tools]
         json.dump({
             "permissions": {"deny": deny},
             "sandbox": {
@@ -154,7 +154,7 @@ runs:
       if: steps.mode.outputs.mode == 'audit'
       uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1.0.266
       with:
-        prompt: "/harness-stocktake:harness-stocktake --project ."
+        prompt: "/harness-stocktake:harness-stocktake --project . --dry-run"
         plugin_marketplaces: ${{ steps.plugin.outputs.dir }}
         plugins: "harness-stocktake@harness-stocktake"
         display_report: "true"

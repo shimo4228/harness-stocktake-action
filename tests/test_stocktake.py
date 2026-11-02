@@ -264,6 +264,27 @@ class FindRunDirTest(Base):
     def test_nothing(self):
         self.assertIsNone(st.find_run_dir(self.root))
 
+    def test_artifact_latest_falls_back_to_the_newest_dir(self):
+        # Plugin v0.2.0's Artifact report writes latest.json with a url and no report path.
+        run = self.write_run(date="2026-11-01", latest=False)
+        (run.parent / "latest.json").write_text(
+            json.dumps({"url": "https://claude.ai/artifact/x", "date": "2026-11-01"})
+        )
+        self.assertEqual(st.find_run_dir(self.root), run)
+
+
+class ActionYmlTest(unittest.TestCase):
+    """The audit must not publish an Artifact into the token owner's claude.ai account."""
+
+    text = (Path(__file__).resolve().parents[1] / "action.yml").read_text()
+
+    def test_audit_is_a_dry_run(self):
+        self.assertIn('prompt: "/harness-stocktake:harness-stocktake --project . --dry-run"', self.text)
+
+    def test_artifact_tools_are_denied(self):
+        for tool in ("Artifact", "ArtifactData", "ArtifactComments"):
+            self.assertIn(f'"{tool}"', self.text)
+
 
 class AuditSyncTest(Base):
     def test_creates_the_tracked_issue(self):

@@ -2,7 +2,7 @@
 
 # harness-stocktake-action
 
-リポジトリの Claude Code ハーネス（`.claude/` の skills・rules・hooks・agents・settings と `CLAUDE.md`）に [harness-stocktake](https://github.com/shimo4228/harness-stocktake)（英語）を月に一度、そしてプルリクエストがハーネスを変えるたびに走らせます。指摘は 1 つの追跡用 issue にまとまります。承認する項目にチェックを入れると、Action がそれらを 1 つのブランチに適用し、プルリクエストを 1 つ開きます。そのプルリクエストをマージすることが承認になります。
+リポジトリの Claude Code ハーネス（`.claude/` の skills・rules・hooks・agents・settings と `CLAUDE.md`）に [harness-stocktake](https://github.com/shimo4228/harness-stocktake/blob/main/README.ja.md)を月に一度、そしてプルリクエストがハーネスを変えるたびに走らせます。指摘は 1 つの追跡用 issue にまとまります。承認する項目にチェックを入れると、Action がそれらを 1 つのブランチに適用し、プルリクエストを 1 つ開きます。そのプルリクエストをマージすることが承認になります。
 
 ## はじめかた
 
@@ -76,7 +76,7 @@ jobs:
 
 ## 何が起きるか
 
-1. **監査**（毎月、手動、または `.claude/**` か `CLAUDE.md` に触れるプルリクエストで）。Action は [claude-code-action](https://github.com/anthropics/claude-code-action)（英語）を通して `/harness-stocktake:harness-stocktake --project .` を実行します。レポートの全文は、その実行のサマリーに出ます。
+1. **監査**（毎月、手動、または `.claude/**` か `CLAUDE.md` に触れるプルリクエストで）。Action は [claude-code-action](https://github.com/anthropics/claude-code-action)（英語）を通して `/harness-stocktake:harness-stocktake --project . --dry-run`（Phase 1–3、Markdown のレポート）を実行します。レポートの全文は、その実行のサマリーに出ます。
 2. **issue。** Action は **Harness stocktake** という題の issue を 1 つだけ開いたままにし、実行のたびにその本文を書き換えます。本文には変更する項目がチェックボックス付きで並び、最後に実行した日付も載ります。項目は最初はチェックが外れています。チェックを入れた項目は、次のレポートで同じ指摘がまた出れば、チェックが入ったまま残ります。
 3. **チェック。** 承認する項目にチェックを入れ、最後に一番下の **Apply the ticked items**（チェックした項目を適用）にチェックを入れます。✋ *by hand*（手作業）の印が付いた項目は、Action が変更できないパスを編集するものです（[変えられないもの](#変えられないもの) を参照）。チェックは入れられますが、適用は自分で行います。
 4. **プルリクエスト。** その編集で適用の実行（apply run）が始まります。適用の実行はチェックした項目だけを適用してコミットし、その結果を固定のブランチ `claude/stocktake` に force push します。そのうえでプルリクエストを開くか、開いているものを更新します。プルリクエストは承認された項目を 2 つに分けます。
@@ -126,7 +126,7 @@ issue は、チェックを入れる前から ✋ *by hand* の項目に印を�
 | `anthropic_api_key` | — | 自分の Anthropic API キー。 |
 | `github_token` | `github.token` | issue、プッシュ、プルリクエストに使う。 |
 | `mode` | `auto` | `auto`: `issues` イベントなら適用し、それ以外のイベントなら監査する。`audit` か `apply` も指定できる。 |
-| `plugin_ref` | `v0.1.0` | 実行する harness-stocktake のタグ、ブランチ、またはコミット。 |
+| `plugin_ref` | `v0.2.0` | 実行する harness-stocktake のタグ、ブランチ、またはコミット。 |
 | `plugin_repository` | `shimo4228/harness-stocktake` | plugin の marketplace がある場所。 |
 | `plugin_token` | `github.token` | `plugin_repository` の読み取り権限。それが非公開リポジトリのときだけ必要。 |
 | `claude_args` | `--permission-mode bypassPermissions` | Claude Code の CLI にそのまま渡す。[サンドボックスと権限](#サンドボックスと権限) を参照。deny ルールはサンドボックスの設定にあるので、自分で引数を設定しても残る。 |
@@ -143,6 +143,7 @@ plugin のモデルは、`for f in .claude/hooks/*.sh; do cat -n "$f"; done` の
 - **確認は切ります**: `--permission-mode bypassPermissions`。このモードでは allow ルールが何もしないので、既定値に `--allowedTools` はありません。
 - **deny ルール**は同じ設定にあり、どのモードでも効きます。
   - `WebFetch`、`WebSearch`、すべての MCP ツール（`mcp__*`）。これらはサンドボックスの外で動き、claude-code-action は `.mcp.json` のサーバーを有効にするからです。
+  - `Artifact`、`ArtifactData`、`ArtifactComments`。OAuth トークンで動く session ではこれらが使えることがあり、plugin は使えればレポートを Artifact（トークンの持ち主の claude.ai アカウントの非公開ページ）として公開するからです。
   - 保護されたパスへの `Edit`、`Write`、`MultiEdit`、`NotebookEdit`（[変えられないもの](#変えられないもの) を参照）。ファイルツールはサンドボックスに入らないので、同じ 4 つのツールは、ランナーのコマンドファイル（`GITHUB_ENV` など）、後続のステップが実行する Action のコード、ホームディレクトリのドットファイルにも使えないようにしています。
 
 サンドボックスはリポジトリを囲む壁ではありません。ワークスペースの中では、シェルコマンドは何でも読めて、上のパス以外はすべて書けます。実行の手が届かないのは、ネットワーク（PyPI と、Claude Code 自身の Anthropic への接続を除く）と、ワークスペースと一時ディレクトリの外のファイルです。リポジトリ自身の `.claude/settings.json` も読み込まれ、hooks を足せるのと同じく、これらの設定を広げられます。Action はハーネスのほかの部分と同じようにそれを信頼します。デフォルトブランチが変わるのは、自分がマージするプルリクエストを通してだけです。
