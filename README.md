@@ -1,3 +1,5 @@
+[English](README.md) | [日本語](README.ja.md)
+
 # harness-stocktake-action
 
 Runs [harness-stocktake](https://github.com/shimo4228/harness-stocktake) on your repository's Claude Code harness (`.claude/` skills, rules, hooks, agents, settings, and `CLAUDE.md`) once a month and whenever a pull request changes it. The findings go into one tracked issue. You tick what you approve, and the Action applies those items on one branch and opens one pull request. Merging that pull request is the approval.
