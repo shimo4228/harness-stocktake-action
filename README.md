@@ -70,6 +70,8 @@ jobs:
           # or: anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
+`v1` moves to each 1.x release. To pin exactly, use `@v1.0.0` or that release's commit SHA.
+
 ## What happens
 
 1. **Audit** (monthly, by hand, or on a pull request that touches `.claude/**` or `CLAUDE.md`). The Action runs `/harness-stocktake:harness-stocktake --project .` through [claude-code-action](https://github.com/anthropics/claude-code-action). The full report appears in the run's summary.
@@ -108,11 +110,11 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 - **No change without your merge.** The Action pushes to one branch only, `claude/stocktake`, and it never pushes to your default branch. It writes nothing to that branch until you tick items. Nothing reaches the default branch until you merge the pull request.
 - **Your repository's own Claude settings apply.** The run is Claude Code inside your repository, so hooks in your committed `.claude/settings.json` run during it. Pull requests from forks are skipped: they get no secrets, and their harness is not yours.
 - `claude/stocktake` belongs to the Action, and each apply force-pushes it. Don't commit to it by hand.
-- Pull requests opened with the workflow's `GITHUB_TOKEN` don't trigger other workflows. To run CI on the stocktake pull request, close and reopen it, or push an empty commit to it yourself.
+- The Action opens the pull request with the workflow's `GITHUB_TOKEN`, so GitHub creates its `pull_request` runs waiting for approval (`action_required`) instead of running them. To run CI on the stocktake pull request, approve those runs, close and reopen the pull request, or push a commit to it yourself.
 
 ## Cost and time
 
-**Not measured yet.** A run is one Claude Code session that starts a subagent for each audit source. Cost and duration depend on how big the harness is. Check them on your first run with your own account.
+On a sample harness (4 skills, 1 rule, 1 agent, 2 hooks), an audit run took about 2 minutes and an apply run about 1.5 minutes on a GitHub-hosted runner (2026-11-01). Cost is not measured yet. A run is one Claude Code session that starts a subagent for each audit source. Cost and duration depend on how big the harness is. Check them on your first run with your own account.
 
 ## Inputs
 
@@ -124,7 +126,7 @@ GitHub pauses scheduled workflows after 60 days without repository activity. The
 | `mode` | `auto` | `auto`: an `issues` event applies, and any other event audits. Can also be `audit` or `apply`. |
 | `plugin_ref` | `v0.1.0` | The harness-stocktake tag, branch, or commit to run. |
 | `plugin_repository` | `shimo4228/harness-stocktake` | Where the plugin marketplace lives. |
-| `plugin_token` | `github.token` | Read access to `plugin_repository`. Only needed while that repository is private. |
+| `plugin_token` | `github.token` | Read access to `plugin_repository`. Needed only when it is a private repository. |
 | `claude_args` | `--permission-mode bypassPermissions` | Passed through to the Claude Code CLI. See [Sandbox and permissions](#sandbox-and-permissions). The deny rules are in the sandbox settings, so setting your own arguments keeps them. |
 
 Outputs: `mode`, `issue_number`, `pr_url`.
@@ -147,8 +149,10 @@ If you set `claude_args` yourself, keep `--permission-mode bypassPermissions`: w
 
 Needs a GitHub-hosted Linux or macOS runner (`sudo` for the packages on Linux), with `git` and Python 3.11 or later (the plugin's scripts need it, and the sandbox keeps uv from downloading one).
 
-## Differences from the plan
+## Design notes
 
+- `plugin_ref` defaults to a plugin release tag. Plugin releases are immutable GitHub releases, so the tag cannot move, and the run logs the commit it fetched.
+- `v1` is a plain tag, not a release. `.github/workflows/major-tag.yml` moves it to each published `v1.x.y` release.
 - `plugin_marketplaces` in claude-code-action v1 accepts only an `https://….git` URL or a local path, so `owner/repo` and a `#ref` pin are both rejected. The Action fetches the plugin at `plugin_ref` and passes that local path.
 - Ticking an issue box needs a trigger, so the workflow also listens to `issues: edited`. The job runs only when the tracked issue's **Apply** box is ticked.
 - Pull request runs report to the run summary only and leave the tracked issue alone (see above).

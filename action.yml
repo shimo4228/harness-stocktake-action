@@ -31,7 +31,7 @@ inputs:
     required: false
     default: "shimo4228/harness-stocktake"
   plugin_token:
-    description: "Token that can read plugin_repository. Only needed while that repository is private."
+    description: "Token that can read plugin_repository. Needed only when plugin_repository is a private repository."
     required: false
     default: ${{ github.token }}
   claude_args:
