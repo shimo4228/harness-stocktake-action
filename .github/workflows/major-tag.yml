@@ -1,0 +1,42 @@
+name: Major tag
+
+# A published release vX.Y.Z moves the plain tag vX to its commit, so `uses: …@v1` follows 1.x.
+# Release tags are immutable releases; vX stays a plain tag (never a release) so it can move.
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    concurrency: major-tag
+    permissions:
+      contents: write
+    steps:
+      - name: Point the major tag at this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$PRERELEASE" != "false" ]]; then
+            echo "skip: $TAG (prerelease=$PRERELEASE)"
+            exit 0
+          fi
+          major="${TAG%%.*}"
+          # A late patch on an older line (v1.0.1 after v1.1.0) must not pull vX back.
+          newest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' |
+            grep -E "^${major}\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1)
+          if [[ "$newest" != "$TAG" ]]; then
+            echo "skip: $TAG is not the newest $major release ($newest)"
+            exit 0
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$major" --silent 2>/dev/null; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" -f sha="$GITHUB_SHA" -F force=true --silent
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$major" -f sha="$GITHUB_SHA" --silent
+          fi
+          echo "$major -> $GITHUB_SHA ($TAG)"
