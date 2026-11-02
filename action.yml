@@ -152,7 +152,7 @@ runs:
     - name: Audit the harness
       id: audit
       if: steps.mode.outputs.mode == 'audit'
-      uses: anthropics/claude-code-action@v1
+      uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1.0.266
       with:
         prompt: "/harness-stocktake:harness-stocktake --project ."
         plugin_marketplaces: ${{ steps.plugin.outputs.dir }}
@@ -188,7 +188,7 @@ runs:
     - name: Apply the ticked items
       id: apply
       if: steps.prepare.outputs.apply == 'true'
-      uses: anthropics/claude-code-action@v1
+      uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1.0.266
       with:
         prompt: >-
           /harness-stocktake:harness-stocktake --project . apply
